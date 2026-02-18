@@ -171,6 +171,15 @@ resource "aws_security_group" "ec2" {
     cidr_blocks = var.allowed_cidr_blocks
   }
 
+  # OpenClaw Gateway direct access
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "OpenClaw Gateway direct access"
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
