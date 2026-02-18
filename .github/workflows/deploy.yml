@@ -1,51 +1,257 @@
-name: Deploy OpenClaw to EC2
+name: OpenClaw EC2 Deployment
 
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      destroy:
+        description: 'Destroy infrastructure (type: destroy)'
+        required: false
+        default: ''
+      force_deploy:
+        description: 'Force deploy even if no changes'
+        required: false
+        type: boolean
+        default: false
 
 env:
   AWS_REGION: us-east-1
+  TF_VERSION: 1.6.0
 
 jobs:
-  deploy:
-    name: Deploy to EC2
+  validate:
+    name: Validate Infrastructure
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
-
-    - name: Deploy Infrastructure
+    
+    - name: Terraform Format Check
+      id: fmt
       run: |
-        echo "🚧 Infrastructure deployment coming soon..."
-        echo "Will deploy:"
-        echo "  - EC2 instance with security groups"
-        echo "  - Application Load Balancer"
-        echo "  - SSL certificates"
-        echo "  - Auto Scaling (optional)"
-        echo "  - CloudWatch monitoring"
-
-    - name: Deploy Application
+        cd infrastructure
+        terraform fmt -check
+        
+    - name: Terraform Init
+      id: init
       run: |
-        echo "🚧 Application deployment coming soon..."
-        echo "Will deploy:"
-        echo "  - OpenClaw Gateway"
-        echo "  - Node.js runtime"
-        echo "  - PM2 process manager"
-        echo "  - Health checks"
-        echo "  - Log aggregation"
-
-    - name: Deployment Summary
+        cd infrastructure
+        terraform init
+        
+    - name: Terraform Validate
+      id: validate
       run: |
-        echo "✅ OpenClaw EC2 deployment initiated"
-        echo "🌐 Will be available at: TBD"
-        echo "📊 Monitor at: CloudWatch Console"
+        cd infrastructure
+        terraform validate
+        
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd infrastructure
+        terraform plan \
+          -var="key_pair_name=${{ secrets.AWS_KEY_PAIR_NAME }}" \
+          -var="allowed_ssh_cidrs=[\"${{ secrets.ALLOWED_SSH_CIDR }}\"]" \
+          -out=tfplan
+        
+    - name: Comment PR with Plan
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const output = `
+          #### Terraform Format and Style 🖌 \`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️ \`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖 \`${{ steps.validate.outcome }}\`
+          #### Terraform Plan 📖 \`${{ steps.plan.outcome }}\`
+          
+          <details><summary>Show Plan</summary>
+          
+          \`\`\`terraform
+          ${{ steps.plan.outputs.stdout }}
+          \`\`\`
+          
+          </details>
+          
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+  deploy:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: validate
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.force_deploy == 'true')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Terraform Init
+      run: |
+        cd infrastructure
+        terraform init
+    
+    - name: Terraform Apply
+      if: github.event.inputs.destroy != 'destroy'
+      run: |
+        cd infrastructure
+        terraform apply -auto-approve \
+          -var="key_pair_name=${{ secrets.AWS_KEY_PAIR_NAME }}" \
+          -var="allowed_ssh_cidrs=[\"${{ secrets.ALLOWED_SSH_CIDR }}\"]" \
+          ${DOMAIN_VAR}
+      env:
+        DOMAIN_VAR: ${{ secrets.DOMAIN_NAME && format('-var="domain_name={0}"', secrets.DOMAIN_NAME) || '' }}
+    
+    - name: Terraform Destroy
+      if: github.event.inputs.destroy == 'destroy'
+      run: |
+        cd infrastructure
+        terraform destroy -auto-approve \
+          -var="key_pair_name=${{ secrets.AWS_KEY_PAIR_NAME }}" \
+          -var="allowed_ssh_cidrs=[\"${{ secrets.ALLOWED_SSH_CIDR }}\"]" \
+          ${DOMAIN_VAR}
+      env:
+        DOMAIN_VAR: ${{ secrets.DOMAIN_NAME && format('-var="domain_name={0}"', secrets.DOMAIN_NAME) || '' }}
+    
+    - name: Get Infrastructure Outputs
+      if: github.event.inputs.destroy != 'destroy'
+      id: outputs
+      run: |
+        cd infrastructure
+        echo "load_balancer_dns=$(terraform output -raw load_balancer_dns)" >> $GITHUB_OUTPUT
+        echo "load_balancer_zone_id=$(terraform output -raw load_balancer_zone_id)" >> $GITHUB_OUTPUT
+    
+    - name: Wait for Instance Health
+      if: github.event.inputs.destroy != 'destroy'
+      run: |
+        echo "Waiting for OpenClaw Gateway to be healthy..."
+        for i in {1..30}; do
+          if curl -f -s --max-time 10 "http://${{ steps.outputs.outputs.load_balancer_dns }}/health" > /dev/null; then
+            echo "✅ OpenClaw Gateway is healthy!"
+            exit 0
+          fi
+          echo "⏳ Attempt $i/30 - waiting 30 seconds..."
+          sleep 30
+        done
+        echo "❌ OpenClaw Gateway failed to become healthy within 15 minutes"
+        exit 1
+    
+    - name: Run Deployment Tests
+      if: github.event.inputs.destroy != 'destroy'
+      run: |
+        echo "Running post-deployment tests..."
+        
+        # Test health endpoint
+        curl -f "http://${{ steps.outputs.outputs.load_balancer_dns }}/health"
+        
+        # Test HTTPS redirect (if domain configured)
+        if [ -n "${{ secrets.DOMAIN_NAME }}" ]; then
+          response=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.DOMAIN_NAME }}")
+          if [ "$response" = "301" ] || [ "$response" = "302" ]; then
+            echo "✅ HTTPS redirect working"
+          else
+            echo "❌ HTTPS redirect not working (got $response)"
+            exit 1
+          fi
+        fi
+        
+        echo "✅ All deployment tests passed!"
+    
+    - name: Create GitHub Deployment
+      if: github.event.inputs.destroy != 'destroy'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const deployment = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'production',
+            description: 'OpenClaw EC2 deployment',
+            auto_merge: false,
+            required_contexts: []
+          });
+          
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.data.id,
+            state: 'success',
+            environment_url: 'http://${{ steps.outputs.outputs.load_balancer_dns }}',
+            description: 'OpenClaw Gateway deployed successfully'
+          });
+    
+    - name: Post Deployment Summary
+      if: github.event.inputs.destroy != 'destroy'
+      run: |
+        echo "🚀 **OpenClaw EC2 Deployment Complete!**"
+        echo ""
+        echo "**Access URLs:**"
+        echo "- Load Balancer: http://${{ steps.outputs.outputs.load_balancer_dns }}"
+        echo "- Health Check: http://${{ steps.outputs.outputs.load_balancer_dns }}/health"
+        if [ -n "${{ secrets.DOMAIN_NAME }}" ]; then
+          echo "- Custom Domain: https://${{ secrets.DOMAIN_NAME }}"
+        fi
+        echo ""
+        echo "**Next Steps:**"
+        echo "1. Configure your OpenClaw client to connect to the deployed gateway"
+        echo "2. Set up DNS records if using a custom domain"
+        echo "3. Configure your OpenClaw authentication tokens"
+        echo "4. Monitor the deployment in AWS CloudWatch"
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'config'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'

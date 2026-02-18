@@ -1,0 +1,18 @@
+# OpenClaw EC2 Deployment - Example Variables
+# Copy this file to terraform.tfvars and customize for your deployment
+
+# AWS Configuration
+aws_region = "us-east-1"
+
+# EC2 Configuration
+instance_type = "t3.small"  # Options: t3.micro, t3.small, t3.medium
+key_pair_name = "my-aws-keypair"  # REQUIRED: Your AWS Key Pair name
+
+# Security Configuration
+allowed_ssh_cidrs = [
+  "0.0.0.0/0"  # CHANGE THIS: Replace with your IP/CIDR for SSH access
+  # Example: ["203.0.113.0/24", "198.51.100.0/24"]
+]
+
+# Optional: SSL Configuration
+# domain_name = "openclaw.yourdomain.com"  # Uncomment and set your domain
