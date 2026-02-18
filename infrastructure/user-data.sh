@@ -340,4 +340,4 @@ echo "Automated backups are scheduled daily at 2 AM"
 echo "Health checks run every 5 minutes"
 
 # Signal completion
-/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${aws_region} || true
+echo "Bootstrap completed successfully at $(date)"
