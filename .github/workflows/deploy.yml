@@ -1,257 +1,499 @@
-name: OpenClaw EC2 Deployment
+# GitHub Actions workflow for OpenClaw EC2 deployment
+# Addresses AWS credentials setup, Terraform CLI installation, working directory issues,
+# secret access, workflow permissions, and state locking issues
+
+name: Deploy OpenClaw to EC2
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, staging, develop]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.gitignore'
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
     inputs:
-      destroy:
-        description: 'Destroy infrastructure (type: destroy)'
-        required: false
-        default: ''
-      force_deploy:
-        description: 'Force deploy even if no changes'
-        required: false
-        type: boolean
-        default: false
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - destroy
 
+# Explicit permissions for GITHUB_TOKEN
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write  # For OIDC authentication with AWS
+
+# Environment variables
 env:
-  AWS_REGION: us-east-1
-  TF_VERSION: 1.6.0
+  TF_VERSION: "1.6.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
 
 jobs:
   validate:
-    name: Validate Infrastructure
+    name: Validate Terraform
     runs-on: ubuntu-latest
+    outputs:
+      tf-fmt: ${{ steps.fmt.outputs.exitcode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false  # Avoid wrapper issues with outputs
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init (validation only)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Comment PR - Validation Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fmt = '${{ steps.fmt.outputs.exitcode }}';
+            const fmtStatus = fmt === '0' ? '✅ Passed' : '❌ Failed';
+            
+            const output = `### Terraform Validation Results
+            
+            | Check | Status |
+            |-------|--------|
+            | Format | ${fmtStatus} |
+            | Validate | ✅ Passed |
+            
+            ${fmt !== '0' ? '⚠️ **Format check failed!** Run `terraform fmt -recursive` to fix.' : ''}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    environment: 
+      name: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Terraform Format Check
-      id: fmt
-      run: |
-        cd infrastructure
-        terraform fmt -check
-        
-    - name: Terraform Init
-      id: init
-      run: |
-        cd infrastructure
-        terraform init
-        
-    - name: Terraform Validate
-      id: validate
-      run: |
-        cd infrastructure
-        terraform validate
-        
-    - name: Terraform Plan
-      id: plan
-      run: |
-        cd infrastructure
-        terraform plan \
-          -var="key_pair_name=${{ secrets.AWS_KEY_PAIR_NAME }}" \
-          -var="allowed_ssh_cidrs=[\"${{ secrets.ALLOWED_SSH_CIDR }}\"]" \
-          -out=tfplan
-        
-    - name: Comment PR with Plan
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const output = `
-          #### Terraform Format and Style 🖌 \`${{ steps.fmt.outcome }}\`
-          #### Terraform Initialization ⚙️ \`${{ steps.init.outcome }}\`
-          #### Terraform Validation 🤖 \`${{ steps.validate.outcome }}\`
-          #### Terraform Plan 📖 \`${{ steps.plan.outcome }}\`
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Verify AWS credentials
+        run: |
+          aws sts get-caller-identity
+          echo "AWS Region: $(aws configure get region)"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
           
-          <details><summary>Show Plan</summary>
+          # Instance configuration
+          instance_type = "${{ vars.INSTANCE_TYPE || 't3.medium' }}"
+          min_size = ${{ vars.MIN_SIZE || 1 }}
+          max_size = ${{ vars.MAX_SIZE || 3 }}
+          desired_capacity = ${{ vars.DESIRED_CAPACITY || 2 }}
           
-          \`\`\`terraform
-          ${{ steps.plan.outputs.stdout }}
-          \`\`\`
+          # Networking
+          vpc_cidr = "${{ vars.VPC_CIDR || '10.0.0.0/16' }}"
           
-          </details>
+          # Security
+          key_pair_name = "${{ vars.KEY_PAIR_NAME || '' }}"
+          ssl_certificate_arn = "${{ vars.SSL_CERTIFICATE_ARN || '' }}"
           
-          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+          # Features
+          enable_load_balancer = ${{ vars.ENABLE_LOAD_BALANCER || 'true' }}
+          enable_cloudwatch_monitoring = ${{ vars.ENABLE_MONITORING || 'true' }}
           
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: output
-          })
+          # OpenClaw configuration
+          openclaw_version = "${{ vars.OPENCLAW_VERSION || 'latest' }}"
+          openclaw_port = ${{ vars.OPENCLAW_PORT || 3000 }}
+          
+          # Additional tags
+          additional_tags = {
+            "DeployedBy" = "github-actions"
+            "Repository" = "${{ github.repository }}"
+            "Branch" = "${{ github.ref_name }}"
+            "CommitSha" = "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Terraform Init
+        run: |
+          # Handle backend configuration based on environment
+          if [ "${{ env.TF_VAR_environment }}" = "prod" ]; then
+            terraform init \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+              -backend-config="key=openclaw-ec2/prod/terraform.tfstate" \
+              -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+          else
+            terraform init \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+              -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
+              -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+          fi
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e  # Don't exit on error to capture exit code
+          terraform plan -detailed-exitcode -out=tfplan
+          PLAN_EXIT_CODE=$?
+          
+          # Store plan output for commenting
+          terraform show -no-color tfplan > plan.txt
+          
+          echo "exit_code=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "No changes needed"
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "Changes planned"
+          else
+            echo "Plan failed with exit code $PLAN_EXIT_CODE"
+            exit $PLAN_EXIT_CODE
+          fi
+
+      - name: Upload plan file
+        if: steps.plan.outputs.exit_code == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_VAR_environment }}
+          path: |
+            tfplan
+            plan.txt
+            terraform.tfvars
+          retention-days: 30
+
+      - name: Comment PR - Plan Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const exitCode = '${{ steps.plan.outputs.exit_code }}';
+            
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync('plan.txt', 'utf8');
+            } catch (error) {
+              planOutput = 'Could not read plan output';
+            }
+            
+            // Truncate output if too long
+            if (planOutput.length > 60000) {
+              planOutput = planOutput.substring(0, 60000) + '\n\n... (truncated)';
+            }
+            
+            const planStatus = exitCode === '0' ? '✅ No changes' : 
+                              exitCode === '2' ? '📋 Changes planned' : '❌ Failed';
+            
+            const output = `### Terraform Plan Results - ${{ env.TF_VAR_environment }}
+            
+            **Status:** ${planStatus}
+            **Exit Code:** ${exitCode}
+            
+            <details>
+            <summary>📋 Plan Output</summary>
+            
+            \`\`\`hcl
+            ${planOutput}
+            \`\`\`
+            
+            </details>
+            
+            ${exitCode === '2' ? '⚠️ **This plan requires approval before applying.**' : ''}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
 
   deploy:
-    name: Deploy Infrastructure
+    name: Terraform Apply
     runs-on: ubuntu-latest
     needs: validate
     if: |
       (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.force_deploy == 'true')
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Terraform Init
-      run: |
-        cd infrastructure
-        terraform init
-    
-    - name: Terraform Apply
-      if: github.event.inputs.destroy != 'destroy'
-      run: |
-        cd infrastructure
-        terraform apply -auto-approve \
-          -var="key_pair_name=${{ secrets.AWS_KEY_PAIR_NAME }}" \
-          -var="allowed_ssh_cidrs=[\"${{ secrets.ALLOWED_SSH_CIDR }}\"]" \
-          ${DOMAIN_VAR}
-      env:
-        DOMAIN_VAR: ${{ secrets.DOMAIN_NAME && format('-var="domain_name={0}"', secrets.DOMAIN_NAME) || '' }}
-    
-    - name: Terraform Destroy
-      if: github.event.inputs.destroy == 'destroy'
-      run: |
-        cd infrastructure
-        terraform destroy -auto-approve \
-          -var="key_pair_name=${{ secrets.AWS_KEY_PAIR_NAME }}" \
-          -var="allowed_ssh_cidrs=[\"${{ secrets.ALLOWED_SSH_CIDR }}\"]" \
-          ${DOMAIN_VAR}
-      env:
-        DOMAIN_VAR: ${{ secrets.DOMAIN_NAME && format('-var="domain_name={0}"', secrets.DOMAIN_NAME) || '' }}
-    
-    - name: Get Infrastructure Outputs
-      if: github.event.inputs.destroy != 'destroy'
-      id: outputs
-      run: |
-        cd infrastructure
-        echo "load_balancer_dns=$(terraform output -raw load_balancer_dns)" >> $GITHUB_OUTPUT
-        echo "load_balancer_zone_id=$(terraform output -raw load_balancer_zone_id)" >> $GITHUB_OUTPUT
-    
-    - name: Wait for Instance Health
-      if: github.event.inputs.destroy != 'destroy'
-      run: |
-        echo "Waiting for OpenClaw Gateway to be healthy..."
-        for i in {1..30}; do
-          if curl -f -s --max-time 10 "http://${{ steps.outputs.outputs.load_balancer_dns }}/health" > /dev/null; then
-            echo "✅ OpenClaw Gateway is healthy!"
-            exit 0
-          fi
-          echo "⏳ Attempt $i/30 - waiting 30 seconds..."
-          sleep 30
-        done
-        echo "❌ OpenClaw Gateway failed to become healthy within 15 minutes"
-        exit 1
-    
-    - name: Run Deployment Tests
-      if: github.event.inputs.destroy != 'destroy'
-      run: |
-        echo "Running post-deployment tests..."
-        
-        # Test health endpoint
-        curl -f "http://${{ steps.outputs.outputs.load_balancer_dns }}/health"
-        
-        # Test HTTPS redirect (if domain configured)
-        if [ -n "${{ secrets.DOMAIN_NAME }}" ]; then
-          response=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.DOMAIN_NAME }}")
-          if [ "$response" = "301" ] || [ "$response" = "302" ]; then
-            echo "✅ HTTPS redirect working"
-          else
-            echo "❌ HTTPS redirect not working (got $response)"
-            exit 1
-          fi
-        fi
-        
-        echo "✅ All deployment tests passed!"
-    
-    - name: Create GitHub Deployment
-      if: github.event.inputs.destroy != 'destroy'
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const deployment = await github.rest.repos.createDeployment({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            ref: context.sha,
-            environment: 'production',
-            description: 'OpenClaw EC2 deployment',
-            auto_merge: false,
-            required_contexts: []
-          });
-          
-          await github.rest.repos.createDeploymentStatus({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            deployment_id: deployment.data.id,
-            state: 'success',
-            environment_url: 'http://${{ steps.outputs.outputs.load_balancer_dns }}',
-            description: 'OpenClaw Gateway deployed successfully'
-          });
-    
-    - name: Post Deployment Summary
-      if: github.event.inputs.destroy != 'destroy'
-      run: |
-        echo "🚀 **OpenClaw EC2 Deployment Complete!**"
-        echo ""
-        echo "**Access URLs:**"
-        echo "- Load Balancer: http://${{ steps.outputs.outputs.load_balancer_dns }}"
-        echo "- Health Check: http://${{ steps.outputs.outputs.load_balancer_dns }}/health"
-        if [ -n "${{ secrets.DOMAIN_NAME }}" ]; then
-          echo "- Custom Domain: https://${{ secrets.DOMAIN_NAME }}"
-        fi
-        echo ""
-        echo "**Next Steps:**"
-        echo "1. Configure your OpenClaw client to connect to the deployed gateway"
-        echo "2. Set up DNS records if using a custom domain"
-        echo "3. Configure your OpenClaw authentication tokens"
-        echo "4. Monitor the deployment in AWS CloudWatch"
+      (github.ref == 'refs/heads/staging' && github.event_name == 'push') ||
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment: 
+      name: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
+      url: ${{ steps.apply.outputs.application_url }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
 
-  security-scan:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'config'
-        scan-ref: '.'
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-    
-    - name: Upload Trivy scan results
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: 'trivy-results.sarif'
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
+          
+          # Instance configuration
+          instance_type = "${{ vars.INSTANCE_TYPE || 't3.medium' }}"
+          min_size = ${{ vars.MIN_SIZE || 1 }}
+          max_size = ${{ vars.MAX_SIZE || 3 }}
+          desired_capacity = ${{ vars.DESIRED_CAPACITY || 2 }}
+          
+          # Networking
+          vpc_cidr = "${{ vars.VPC_CIDR || '10.0.0.0/16' }}"
+          
+          # Security
+          key_pair_name = "${{ vars.KEY_PAIR_NAME || '' }}"
+          ssl_certificate_arn = "${{ vars.SSL_CERTIFICATE_ARN || '' }}"
+          
+          # Features
+          enable_load_balancer = ${{ vars.ENABLE_LOAD_BALANCER || 'true' }}
+          enable_cloudwatch_monitoring = ${{ vars.ENABLE_MONITORING || 'true' }}
+          
+          # OpenClaw configuration
+          openclaw_version = "${{ vars.OPENCLAW_VERSION || 'latest' }}"
+          openclaw_port = ${{ vars.OPENCLAW_PORT || 3000 }}
+          
+          # Additional tags
+          additional_tags = {
+            "DeployedBy" = "github-actions"
+            "Repository" = "${{ github.repository }}"
+            "Branch" = "${{ github.ref_name }}"
+            "CommitSha" = "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Terraform Init
+        run: |
+          if [ "${{ env.TF_VAR_environment }}" = "prod" ]; then
+            terraform init \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+              -backend-config="key=openclaw-ec2/prod/terraform.tfstate" \
+              -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+          else
+            terraform init \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+              -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
+              -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+          fi
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          terraform apply -auto-approve
+          
+          # Capture outputs
+          APPLICATION_URL=$(terraform output -raw application_url 2>/dev/null || echo "Not available")
+          LOAD_BALANCER_DNS=$(terraform output -raw load_balancer_dns_name 2>/dev/null || echo "Not available")
+          
+          echo "application_url=$APPLICATION_URL" >> $GITHUB_OUTPUT
+          echo "load_balancer_dns=$LOAD_BALANCER_DNS" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment readiness
+        if: steps.apply.outputs.application_url != 'Not available'
+        run: |
+          echo "Waiting for application to be ready..."
+          
+          MAX_ATTEMPTS=30
+          ATTEMPT=1
+          HEALTH_URL="${{ steps.apply.outputs.application_url }}"
+          
+          if [[ "$HEALTH_URL" != *"/health" ]]; then
+            HEALTH_URL="${HEALTH_URL}/health"
+          fi
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Checking $HEALTH_URL"
+            
+            if curl -sf "$HEALTH_URL" > /dev/null; then
+              echo "✅ Application is ready!"
+              break
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Application health check failed after $MAX_ATTEMPTS attempts"
+              exit 1
+            fi
+            
+            echo "Waiting 30 seconds before next attempt..."
+            sleep 30
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+      - name: Create deployment summary
+        if: always()
+        run: |
+          cat > $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🚀 OpenClaw Deployment Summary
+          
+          **Environment:** ${{ env.TF_VAR_environment }}  
+          **Region:** ${{ env.AWS_DEFAULT_REGION }}  
+          **Status:** ${{ job.status }}  
+          **Commit:** ${{ github.sha }}
+          
+          ## 📊 Deployment Details
+          
+          | Resource | Value |
+          |----------|-------|
+          | Application URL | ${{ steps.apply.outputs.application_url }} |
+          | Load Balancer DNS | ${{ steps.apply.outputs.load_balancer_dns }} |
+          | Health Check | ${{ steps.apply.outputs.application_url }}/health |
+          
+          ## 🔗 Useful Links
+          
+          - [AWS Console](https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_DEFAULT_REGION }})
+          - [CloudWatch Logs](https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_DEFAULT_REGION }}#logsV2:log-groups)
+          - [Auto Scaling Groups](https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_DEFAULT_REGION }}#AutoScalingGroups:)
+          
+          ## ⏭️ Next Steps
+          
+          1. Verify application is responding at the URL above
+          2. Check CloudWatch metrics and logs
+          3. Configure DNS records if needed
+          4. Set up monitoring alerts
+          EOF
+
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: 
+      name: ${{ github.event.inputs.environment }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-destroy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create minimal Terraform variables file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
+          EOF
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+            -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve

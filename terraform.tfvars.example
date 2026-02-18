@@ -1,0 +1,83 @@
+# Example Terraform variables file for OpenClaw EC2 deployment
+# Copy this file to terraform.tfvars and adjust values as needed
+
+# AWS Configuration
+aws_region = "us-east-1"
+environment = "dev"
+project_name = "openclaw"
+
+# State Management (set to false if state bucket already exists)
+create_state_bucket = true
+
+# VPC and Networking
+vpc_cidr = "10.0.0.0/16"
+# availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]  # Leave empty for auto-discovery
+
+# EC2 Instance Configuration
+instance_type = "t3.medium"
+ami_id = ""  # Leave empty for latest Amazon Linux 2
+key_pair_name = "my-key-pair"  # Create this key pair in AWS EC2 console first
+
+# Auto Scaling Configuration
+min_size = 1
+max_size = 5
+desired_capacity = 2
+
+# Load Balancer Configuration
+enable_load_balancer = true
+ssl_certificate_arn = ""  # ARN of SSL certificate in AWS Certificate Manager
+
+# Security Configuration
+allowed_cidr_blocks = ["0.0.0.0/0"]  # Restrict this in production!
+
+# OpenClaw Application Configuration
+openclaw_port = 3000
+openclaw_version = "latest"
+
+# Monitoring and Logging
+enable_cloudwatch_monitoring = true
+
+# Backup Configuration
+backup_retention_days = 7
+
+# Additional Resource Tags
+additional_tags = {
+  "Owner"       = "your-name"
+  "Department"  = "engineering"
+  "CostCenter"  = "12345"
+  "Schedule"    = "business-hours"  # For automated start/stop
+}
+
+# Example configurations for different environments:
+
+# Development Environment
+# aws_region = "us-east-1"
+# environment = "dev"
+# instance_type = "t3.small"
+# min_size = 1
+# max_size = 2
+# desired_capacity = 1
+# enable_load_balancer = false
+# ssl_certificate_arn = ""
+
+# Staging Environment
+# aws_region = "us-east-1"
+# environment = "staging" 
+# instance_type = "t3.medium"
+# min_size = 1
+# max_size = 3
+# desired_capacity = 2
+# enable_load_balancer = true
+# ssl_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+
+# Production Environment
+# aws_region = "us-east-1"
+# environment = "prod"
+# instance_type = "t3.large"
+# min_size = 2
+# max_size = 10
+# desired_capacity = 3
+# enable_load_balancer = true
+# ssl_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+# allowed_cidr_blocks = ["10.0.0.0/8", "192.168.0.0/16"]  # More restrictive
+# backup_retention_days = 30
