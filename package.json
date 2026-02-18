@@ -1,0 +1,38 @@
+{
+  "name": "openclaw-ec2-deploy",
+  "version": "1.0.0",
+  "description": "OpenClaw EC2 deployment infrastructure with comprehensive fixes",
+  "main": "index.js",
+  "scripts": {
+    "validate-aws": "node scripts/validate-aws.js",
+    "deploy": "node scripts/deploy.js",
+    "destroy": "node scripts/destroy.js",
+    "status": "node scripts/status.js",
+    "terraform-init": "cd terraform && terraform init",
+    "terraform-plan": "cd terraform && terraform plan",
+    "terraform-apply": "cd terraform && terraform apply -auto-approve",
+    "terraform-destroy": "cd terraform && terraform destroy -auto-approve",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "aws",
+    "ec2",
+    "terraform",
+    "openclaw",
+    "infrastructure"
+  ],
+  "author": "OpenClaw Deploy",
+  "license": "MIT",
+  "dependencies": {
+    "aws-sdk": "^2.1691.0",
+    "dotenv": "^16.4.5",
+    "chalk": "^4.1.2",
+    "inquirer": "^8.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

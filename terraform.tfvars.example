@@ -1,83 +1,40 @@
-# Example Terraform variables file for OpenClaw EC2 deployment
-# Copy this file to terraform.tfvars and adjust values as needed
+# Example Terraform variables for OpenClaw EC2 Deployment
+# Copy this file to terraform.tfvars and customize the values
 
 # AWS Configuration
-aws_region = "us-east-1"
-environment = "dev"
+aws_region = "us-east-1"  # Change to your preferred region
+environment = "dev"       # dev, staging, or prod
+
+# Project Configuration
 project_name = "openclaw"
 
-# State Management (set to false if state bucket already exists)
-create_state_bucket = true
-
-# VPC and Networking
-vpc_cidr = "10.0.0.0/16"
-# availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]  # Leave empty for auto-discovery
-
-# EC2 Instance Configuration
-instance_type = "t3.medium"
-ami_id = ""  # Leave empty for latest Amazon Linux 2
-key_pair_name = "my-key-pair"  # Create this key pair in AWS EC2 console first
+# Instance Configuration
+instance_type = "t3.medium"  # t3.micro, t3.small, t3.medium, t3.large
+key_pair_name = ""           # Your AWS Key Pair name (optional)
 
 # Auto Scaling Configuration
 min_size = 1
-max_size = 5
+max_size = 3
 desired_capacity = 2
 
-# Load Balancer Configuration
-enable_load_balancer = true
-ssl_certificate_arn = ""  # ARN of SSL certificate in AWS Certificate Manager
+# Network Configuration
+vpc_cidr = "10.0.0.0/16"
+allowed_cidr_blocks = ["0.0.0.0/0"]  # Restrict this to your IP ranges
 
 # Security Configuration
-allowed_cidr_blocks = ["0.0.0.0/0"]  # Restrict this in production!
+ssl_certificate_arn = ""  # ARN of SSL certificate (optional)
 
-# OpenClaw Application Configuration
-openclaw_port = 3000
-openclaw_version = "latest"
-
-# Monitoring and Logging
+# Feature Configuration
+enable_load_balancer = true
 enable_cloudwatch_monitoring = true
 
-# Backup Configuration
-backup_retention_days = 7
+# OpenClaw Configuration
+openclaw_version = "latest"
+openclaw_port = 3000
 
-# Additional Resource Tags
+# Additional Tags
 additional_tags = {
-  "Owner"       = "your-name"
-  "Department"  = "engineering"
-  "CostCenter"  = "12345"
-  "Schedule"    = "business-hours"  # For automated start/stop
+  "Owner"     = "your-name"
+  "Purpose"   = "openclaw-gateway"
+  "CostCenter" = "engineering"
 }
-
-# Example configurations for different environments:
-
-# Development Environment
-# aws_region = "us-east-1"
-# environment = "dev"
-# instance_type = "t3.small"
-# min_size = 1
-# max_size = 2
-# desired_capacity = 1
-# enable_load_balancer = false
-# ssl_certificate_arn = ""
-
-# Staging Environment
-# aws_region = "us-east-1"
-# environment = "staging" 
-# instance_type = "t3.medium"
-# min_size = 1
-# max_size = 3
-# desired_capacity = 2
-# enable_load_balancer = true
-# ssl_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
-
-# Production Environment
-# aws_region = "us-east-1"
-# environment = "prod"
-# instance_type = "t3.large"
-# min_size = 2
-# max_size = 10
-# desired_capacity = 3
-# enable_load_balancer = true
-# ssl_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
-# allowed_cidr_blocks = ["10.0.0.0/8", "192.168.0.0/16"]  # More restrictive
-# backup_retention_days = 30

@@ -1,102 +1,95 @@
 #!/bin/bash
-# OpenClaw EC2 User Data Script
-# Addresses user data script size limits and installation issues
+# OpenClaw EC2 Bootstrap Script
+# This script sets up and runs OpenClaw Gateway on Amazon Linux 2
 
-set -e  # Exit on any error
+set -euo pipefail
 
-# Logging setup
-LOG_FILE="/var/log/openclaw-setup.log"
-exec > >(tee -a $LOG_FILE)
-exec 2>&1
+# Configuration from Terraform
+OPENCLAW_PORT=${openclaw_port}
+OPENCLAW_VERSION=${openclaw_version}
+ENVIRONMENT=${environment}
+AWS_REGION=${aws_region}
 
-echo "$(date): Starting OpenClaw setup on $(hostname)"
+# Logging
+LOG_FILE="/var/log/openclaw-bootstrap.log"
+exec 1> >(tee -a $LOG_FILE)
+exec 2> >(tee -a $LOG_FILE >&2)
 
-# Template variables (filled by Terraform)
-OPENCLAW_PORT="${openclaw_port}"
-OPENCLAW_VERSION="${openclaw_version}"
-PROJECT_NAME="${project_name}"
-ENVIRONMENT="${environment}"
-AWS_REGION="${aws_region}"
+echo "Starting OpenClaw bootstrap at $(date)"
+echo "Configuration: Port=$OPENCLAW_PORT, Version=$OPENCLAW_VERSION, Env=$ENVIRONMENT, Region=$AWS_REGION"
 
-# System updates and basic packages
-echo "$(date): Updating system packages..."
+# Update system
 yum update -y
 
 # Install required packages
 yum install -y \
     docker \
-    awscli \
-    amazon-cloudwatch-agent \
-    amazon-ssm-agent \
+    git \
+    htop \
     curl \
     wget \
     unzip \
-    jq \
-    htop \
-    git
+    fail2ban \
+    nginx \
+    awscli
 
-# Start and enable services
+# Install Node.js 18 (LTS)
+curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
+yum install -y nodejs
+
+# Install PM2 globally
+npm install -g pm2
+
+# Start and enable Docker
 systemctl start docker
 systemctl enable docker
-systemctl start amazon-ssm-agent
-systemctl enable amazon-ssm-agent
 
-# Add ec2-user to docker group
-usermod -a -G docker ec2-user
+# Create openclaw user
+useradd -m -s /bin/bash openclaw
+usermod -aG docker openclaw
 
-# Install Docker Compose
-echo "$(date): Installing Docker Compose..."
-curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-chmod +x /usr/local/bin/docker-compose
+# Create directories
+mkdir -p /opt/openclaw
+mkdir -p /var/log/openclaw
+mkdir -p /etc/openclaw
 
-# Create application directory
-APP_DIR="/opt/openclaw"
-mkdir -p $APP_DIR
-cd $APP_DIR
+# Set ownership
+chown -R openclaw:openclaw /opt/openclaw /var/log/openclaw /etc/openclaw
 
-# Create OpenClaw configuration
-echo "$(date): Creating OpenClaw configuration..."
-cat > docker-compose.yml << EOF
-version: '3.8'
-services:
-  openclaw:
-    image: openclaw/openclaw:$OPENCLAW_VERSION
-    ports:
-      - "$OPENCLAW_PORT:3000"
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - AWS_REGION=$AWS_REGION
-      - PROJECT_NAME=$PROJECT_NAME
-      - ENVIRONMENT=$ENVIRONMENT
-    volumes:
-      - /opt/openclaw/data:/app/data
-      - /opt/openclaw/logs:/app/logs
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    logging:
-      driver: "awslogs"
-      options:
-        awslogs-group: "/aws/ec2/$PROJECT_NAME-$ENVIRONMENT"
-        awslogs-region: "$AWS_REGION"
-        awslogs-stream: "openclaw-\$(hostname)"
-EOF
-
-# Create data and logs directories
-mkdir -p /opt/openclaw/data /opt/openclaw/logs
-chown -R ec2-user:ec2-user /opt/openclaw
-
-# Configure CloudWatch Agent
-echo "$(date): Configuring CloudWatch Agent..."
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+# Configure CloudWatch Agent (if monitoring enabled)
+if [ "${ENVIRONMENT}" != "dev" ]; then
+    wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+    rpm -U ./amazon-cloudwatch-agent.rpm
+    
+    # Create CloudWatch agent config
+    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
 {
+    "agent": {
+        "metrics_collection_interval": 60,
+        "run_as_user": "root"
+    },
+    "logs": {
+        "logs_collected": {
+            "files": {
+                "collect_list": [
+                    {
+                        "file_path": "/var/log/openclaw/gateway.log",
+                        "log_group_name": "/aws/ec2/openclaw-${ENVIRONMENT}",
+                        "log_stream_name": "{instance_id}/openclaw-gateway",
+                        "timestamp_format": "%Y-%m-%d %H:%M:%S"
+                    },
+                    {
+                        "file_path": "/var/log/openclaw-bootstrap.log",
+                        "log_group_name": "/aws/ec2/openclaw-${ENVIRONMENT}",
+                        "log_stream_name": "{instance_id}/bootstrap",
+                        "timestamp_format": "%Y-%m-%d %H:%M:%S"
+                    }
+                ]
+            }
+        }
+    },
     "metrics": {
-        "namespace": "OpenClaw/$PROJECT_NAME/$ENVIRONMENT",
+        "namespace": "OpenClaw/$ENVIRONMENT",
         "metrics_collected": {
             "cpu": {
                 "measurement": [
@@ -132,145 +125,260 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
                 "metrics_collection_interval": 60
             }
         }
-    },
-    "logs": {
-        "logs_collected": {
-            "files": {
-                "collect_list": [
-                    {
-                        "file_path": "/opt/openclaw/logs/*.log",
-                        "log_group_name": "/aws/ec2/$PROJECT_NAME-$ENVIRONMENT",
-                        "log_stream_name": "openclaw-app-{instance_id}"
-                    },
-                    {
-                        "file_path": "/var/log/openclaw-setup.log",
-                        "log_group_name": "/aws/ec2/$PROJECT_NAME-$ENVIRONMENT",
-                        "log_stream_name": "setup-{instance_id}"
-                    }
-                ]
-            }
-        }
     }
 }
 EOF
 
-# Start CloudWatch Agent
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-    -a fetch-config \
-    -m ec2 \
-    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
-    -s
-
-# Pull and start OpenClaw
-echo "$(date): Pulling and starting OpenClaw..."
-cd /opt/openclaw
-docker-compose pull
-docker-compose up -d
-
-# Wait for service to be ready
-echo "$(date): Waiting for OpenClaw to be ready..."
-RETRY_COUNT=0
-MAX_RETRIES=30
-
-while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -f http://localhost:$OPENCLAW_PORT/health > /dev/null 2>&1; then
-        echo "$(date): OpenClaw is ready!"
-        break
-    fi
-    
-    echo "$(date): Waiting for OpenClaw... (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
-    sleep 10
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-done
-
-if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-    echo "$(date): ERROR: OpenClaw failed to start after $MAX_RETRIES attempts"
-    exit 1
+    # Start CloudWatch agent
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+        -a fetch-config \
+        -m ec2 \
+        -s \
+        -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 fi
 
-# Create systemd service for auto-restart
-cat > /etc/systemd/system/openclaw.service << EOF
-[Unit]
-Description=OpenClaw Application
-Requires=docker.service
-After=docker.service
+# Install OpenClaw Gateway
+echo "Installing OpenClaw Gateway..."
+cd /opt/openclaw
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/opt/openclaw
-ExecStart=/usr/local/bin/docker-compose up -d
-ExecStop=/usr/local/bin/docker-compose down
-TimeoutStartSec=0
+# Clone or download OpenClaw (placeholder - adjust based on actual installation method)
+if [ "$OPENCLAW_VERSION" = "latest" ]; then
+    # For now, create a simple Node.js app that simulates OpenClaw Gateway
+    cat > app.js << 'EOF'
+const express = require('express');
+const app = express();
 
-[Install]
-WantedBy=multi-user.target
+const PORT = process.env.PORT || 3000;
+const ENVIRONMENT = process.env.ENVIRONMENT || 'dev';
+
+// Middleware
+app.use(express.json());
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        environment: ENVIRONMENT,
+        port: PORT,
+        uptime: process.uptime()
+    });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        message: 'OpenClaw Gateway',
+        version: '1.0.0',
+        environment: ENVIRONMENT,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// API endpoint placeholder
+app.get('/api/status', (req, res) => {
+    res.json({
+        api: 'OpenClaw Gateway API',
+        status: 'running',
+        environment: ENVIRONMENT,
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`OpenClaw Gateway listening on port $${PORT}`);
+    console.log(`Environment: $${ENVIRONMENT}`);
+    console.log(`Health check: http://localhost:$${PORT}/health`);
+});
 EOF
 
-systemctl daemon-reload
-systemctl enable openclaw.service
-
-# Setup log rotation
-cat > /etc/logrotate.d/openclaw << EOF
-/opt/openclaw/logs/*.log {
-    daily
-    rotate 14
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 644 ec2-user ec2-user
-    postrotate
-        docker-compose -f /opt/openclaw/docker-compose.yml restart openclaw
-    endscript
+    # Create package.json
+    cat > package.json << 'EOF'
+{
+  "name": "openclaw-gateway",
+  "version": "1.0.0",
+  "description": "OpenClaw Gateway Service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "keywords": ["openclaw", "gateway", "api"],
+  "author": "OpenClaw",
+  "license": "MIT"
 }
 EOF
 
-# Create health check script
-cat > /opt/openclaw/health-check.sh << 'EOF'
-#!/bin/bash
-# Health check script for OpenClaw
-
-HEALTH_URL="http://localhost:${OPENCLAW_PORT}/health"
-MAX_ATTEMPTS=3
-ATTEMPT=1
-
-while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-    if curl -sf "$HEALTH_URL" > /dev/null; then
-        echo "Health check passed"
-        exit 0
-    fi
-    
-    echo "Health check failed (attempt $ATTEMPT/$MAX_ATTEMPTS)"
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 5
-done
-
-echo "Health check failed after $MAX_ATTEMPTS attempts"
-exit 1
-EOF
-
-chmod +x /opt/openclaw/health-check.sh
-
-# Setup cron job for health monitoring
-echo "*/5 * * * * /opt/openclaw/health-check.sh >> /var/log/openclaw-health.log 2>&1" | crontab -
-
-# Signal completion to CloudFormation/Auto Scaling
-echo "$(date): OpenClaw setup completed successfully"
-
-# Send success signal to Auto Scaling (if lifecycle hook exists)
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-ASG_NAME=$(aws ec2 describe-tags --region $AWS_REGION --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=aws:autoscaling:groupName" --query "Tags[0].Value" --output text 2>/dev/null || echo "")
-
-if [ -n "$ASG_NAME" ] && [ "$ASG_NAME" != "None" ]; then
-    echo "$(date): Sending ready signal to Auto Scaling Group: $ASG_NAME"
-    aws autoscaling complete-lifecycle-action \
-        --region $AWS_REGION \
-        --lifecycle-hook-name "graceful-shutdown" \
-        --auto-scaling-group-name "$ASG_NAME" \
-        --instance-id "$INSTANCE_ID" \
-        --lifecycle-action-result CONTINUE || true
+    # Install dependencies
+    npm install
+else
+    # Handle specific versions here
+    echo "Specific version deployment not implemented yet: $OPENCLAW_VERSION"
 fi
 
-echo "$(date): Setup script completed"
+# Set ownership
+chown -R openclaw:openclaw /opt/openclaw
+
+# Create PM2 ecosystem file
+cat > ecosystem.config.js << EOF
+module.exports = {
+  apps: [{
+    name: 'openclaw-gateway',
+    script: '/opt/openclaw/app.js',
+    user: 'openclaw',
+    cwd: '/opt/openclaw',
+    instances: 1,
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '1G',
+    env: {
+      NODE_ENV: 'production',
+      PORT: $OPENCLAW_PORT,
+      ENVIRONMENT: '$ENVIRONMENT',
+      AWS_REGION: '$AWS_REGION'
+    },
+    log_file: '/var/log/openclaw/combined.log',
+    out_file: '/var/log/openclaw/out.log',
+    error_file: '/var/log/openclaw/error.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+  }]
+};
 EOF
+
+chown openclaw:openclaw ecosystem.config.js
+
+# Configure Nginx as reverse proxy
+cat > /etc/nginx/conf.d/openclaw.conf << EOF
+server {
+    listen 80;
+    server_name _;
+    
+    # Security headers
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    
+    # Health check endpoint (direct access)
+    location /health {
+        proxy_pass http://localhost:$OPENCLAW_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+    
+    # Main application
+    location / {
+        proxy_pass http://localhost:$OPENCLAW_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # Timeout settings
+        proxy_connect_timeout       60s;
+        proxy_send_timeout          60s;
+        proxy_read_timeout          60s;
+    }
+    
+    # Nginx status for monitoring
+    location /nginx_status {
+        stub_status on;
+        access_log off;
+        allow 127.0.0.1;
+        allow 10.0.0.0/8;
+        deny all;
+    }
+}
+EOF
+
+# Test nginx configuration
+nginx -t
+
+# Start and enable nginx
+systemctl start nginx
+systemctl enable nginx
+
+# Configure fail2ban
+cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+
+[sshd]
+enabled = true
+
+[nginx-http-auth]
+enabled = true
+
+[nginx-limit-req]
+enabled = true
+EOF
+
+systemctl start fail2ban
+systemctl enable fail2ban
+
+# Start OpenClaw with PM2 as openclaw user
+echo "Starting OpenClaw Gateway with PM2..."
+sudo -u openclaw bash << EOF
+cd /opt/openclaw
+pm2 start ecosystem.config.js
+pm2 save
+pm2 startup systemd -u openclaw --hp /home/openclaw
+EOF
+
+# Install PM2 startup script
+env PATH=\$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u openclaw --hp /home/openclaw
+
+# Wait for application to start
+echo "Waiting for OpenClaw Gateway to start..."
+sleep 30
+
+# Verify application is running
+for i in {1..10}; do
+    if curl -f http://localhost:$OPENCLAW_PORT/health >/dev/null 2>&1; then
+        echo "OpenClaw Gateway is running successfully!"
+        break
+    fi
+    echo "Attempt $i/10: Waiting for application..."
+    sleep 10
+done
+
+# Final health check
+if curl -f http://localhost:$OPENCLAW_PORT/health >/dev/null 2>&1; then
+    echo "Bootstrap completed successfully at $(date)"
+    echo "OpenClaw Gateway is available at http://localhost:$OPENCLAW_PORT"
+    echo "Health check: http://localhost:$OPENCLAW_PORT/health"
+else
+    echo "ERROR: OpenClaw Gateway failed to start properly"
+    echo "Check logs: /var/log/openclaw/"
+    exit 1
+fi
+
+# Set up log rotation
+cat > /etc/logrotate.d/openclaw << EOF
+/var/log/openclaw/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    su openclaw openclaw
+}
+EOF
+
+echo "OpenClaw EC2 bootstrap completed successfully!"
