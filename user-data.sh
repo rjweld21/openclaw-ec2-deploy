@@ -137,15 +137,388 @@ EOF
         -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 fi
 
-# Install OpenClaw Gateway
-echo "Installing OpenClaw Gateway..."
+# Install OpenClaw Gateway with React Frontend
+echo "Installing OpenClaw Gateway with React Frontend..."
 cd /opt/openclaw
 
-# Clone or download OpenClaw (placeholder - adjust based on actual installation method)
+# Create full-stack OpenClaw application
 if [ "$OPENCLAW_VERSION" = "latest" ]; then
-    # For now, create a simple Node.js app that simulates OpenClaw Gateway
+    # Create React frontend structure
+    mkdir -p frontend/src frontend/public
+    
+    # Create package.json for React frontend
+    cat > frontend/package.json << 'EOF'
+{
+  "name": "openclaw-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.4",
+    "@testing-library/react": "^13.3.0",
+    "@testing-library/user-event": "^13.5.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.3.0",
+    "react-scripts": "5.0.1",
+    "web-vitals": "^2.1.4"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "homepage": "."
+}
+EOF
+
+    # Create React App.js
+    cat > frontend/src/App.js << 'EOF'
+import React, { useState, useEffect } from 'react';
+import './App.css';
+
+function App() {
+  const [status, setStatus] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetchStatus();
+  }, []);
+
+  const fetchStatus = async () => {
+    try {
+      const response = await fetch('/api/status');
+      const data = await response.json();
+      setStatus(data);
+    } catch (err) {
+      setError('Failed to fetch status');
+      console.error('Error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="App">
+      <header className="App-header">
+        <div className="logo">
+          <h1>🦾 OpenClaw Gateway</h1>
+          <p>Your AI-Powered Assistant Platform</p>
+        </div>
+        
+        <div className="status-card">
+          <h2>System Status</h2>
+          {loading && <div className="loading">Loading...</div>}
+          {error && <div className="error">{error}</div>}
+          {status && (
+            <div className="status-info">
+              <div className="status-item">
+                <strong>API Status:</strong> 
+                <span className="status-healthy">{status.status}</span>
+              </div>
+              <div className="status-item">
+                <strong>Environment:</strong> {status.environment}
+              </div>
+              <div className="status-item">
+                <strong>Last Updated:</strong> {new Date(status.timestamp).toLocaleString()}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="features">
+          <h2>Features</h2>
+          <div className="feature-grid">
+            <div className="feature">
+              <h3>🤖 AI Assistant</h3>
+              <p>Intelligent conversation and task automation</p>
+            </div>
+            <div className="feature">
+              <h3>🌐 Web Integration</h3>
+              <p>Connect with websites and online services</p>
+            </div>
+            <div className="feature">
+              <h3>📱 Cross-Platform</h3>
+              <p>Works on desktop, mobile, and web</p>
+            </div>
+            <div className="feature">
+              <h3>🔒 Secure</h3>
+              <p>Enterprise-grade security and privacy</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="actions">
+          <button onClick={fetchStatus} className="refresh-btn">
+            Refresh Status
+          </button>
+        </div>
+      </header>
+    </div>
+  );
+}
+
+export default App;
+EOF
+
+    # Create React App.css
+    cat > frontend/src/App.css << 'EOF'
+.App {
+  text-align: center;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+}
+
+.App-header {
+  padding: 20px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.logo h1 {
+  font-size: 3.5rem;
+  margin: 20px 0 10px 0;
+  text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+}
+
+.logo p {
+  font-size: 1.3rem;
+  margin-bottom: 40px;
+  opacity: 0.9;
+}
+
+.status-card {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 15px;
+  padding: 30px;
+  margin: 30px auto;
+  max-width: 600px;
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.status-card h2 {
+  margin-top: 0;
+  font-size: 1.8rem;
+}
+
+.status-info {
+  text-align: left;
+  margin: 20px 0;
+}
+
+.status-item {
+  margin: 15px 0;
+  font-size: 1.1rem;
+}
+
+.status-item strong {
+  display: inline-block;
+  width: 140px;
+}
+
+.status-healthy {
+  color: #4ade80;
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+.loading {
+  font-size: 1.1rem;
+  opacity: 0.8;
+  animation: pulse 1.5s ease-in-out infinite alternate;
+}
+
+@keyframes pulse {
+  from { opacity: 0.6; }
+  to { opacity: 1; }
+}
+
+.error {
+  color: #ef4444;
+  font-weight: bold;
+  padding: 10px;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 8px;
+}
+
+.features {
+  margin: 50px 0;
+}
+
+.features h2 {
+  font-size: 2.2rem;
+  margin-bottom: 30px;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 25px;
+  margin: 30px 0;
+}
+
+.feature {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 25px;
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.feature:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+}
+
+.feature h3 {
+  margin: 0 0 15px 0;
+  font-size: 1.3rem;
+}
+
+.feature p {
+  margin: 0;
+  opacity: 0.9;
+  line-height: 1.5;
+}
+
+.actions {
+  margin: 40px 0;
+}
+
+.refresh-btn {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  padding: 12px 30px;
+  font-size: 1.1rem;
+  border-radius: 25px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  backdrop-filter: blur(10px);
+}
+
+.refresh-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: scale(1.05);
+}
+
+@media (max-width: 768px) {
+  .logo h1 {
+    font-size: 2.5rem;
+  }
+  
+  .feature-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .status-card {
+    margin: 20px;
+    padding: 20px;
+  }
+}
+EOF
+
+    # Create React index.js
+    cat > frontend/src/index.js << 'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+EOF
+
+    # Create index.css
+    cat > frontend/src/index.css << 'EOF'
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+EOF
+
+    # Create public/index.html
+    cat > frontend/public/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="OpenClaw Gateway - Your AI-Powered Assistant Platform"
+    />
+    <title>OpenClaw Gateway</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+  </body>
+</html>
+EOF
+
+    # Create a simple favicon
+    echo "" > frontend/public/favicon.ico
+
+    # Build React frontend
+    cd /opt/openclaw/frontend
+    npm install
+    npm run build
+    
+    # Move build files to serve directory
+    cd /opt/openclaw
+    mkdir -p public
+    cp -r frontend/build/* public/
+    
+    # Create Express server that serves React app and API
     cat > app.js << 'EOF'
 const express = require('express');
+const path = require('path');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
@@ -153,67 +526,111 @@ const ENVIRONMENT = process.env.ENVIRONMENT || 'dev';
 
 // Middleware
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Health check endpoint
+// Serve static React build files
+app.use(express.static(path.join(__dirname, 'public')));
+
+// API Routes
+app.get('/api/status', (req, res) => {
+    res.json({
+        api: 'OpenClaw Gateway API',
+        status: 'running',
+        environment: ENVIRONMENT,
+        timestamp: new Date().toISOString(),
+        version: '1.0.0',
+        uptime: process.uptime()
+    });
+});
+
+// Health check endpoint (for load balancer)
 app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
         environment: ENVIRONMENT,
         port: PORT,
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        version: '1.0.0'
     });
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
+// Additional API endpoints
+app.get('/api/info', (req, res) => {
     res.json({
-        message: 'OpenClaw Gateway',
+        name: 'OpenClaw Gateway',
         version: '1.0.0',
         environment: ENVIRONMENT,
-        timestamp: new Date().toISOString()
+        features: [
+            'AI Assistant',
+            'Web Integration', 
+            'Cross-Platform',
+            'Secure'
+        ],
+        endpoints: {
+            health: '/health',
+            status: '/api/status',
+            info: '/api/info'
+        }
     });
 });
 
-// API endpoint placeholder
-app.get('/api/status', (req, res) => {
-    res.json({
-        api: 'OpenClaw Gateway API',
-        status: 'running',
+// Serve React app for all non-API routes (SPA routing)
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ 
+        error: 'Something went wrong!',
         environment: ENVIRONMENT,
         timestamp: new Date().toISOString()
     });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`OpenClaw Gateway listening on port $${PORT}`);
-    console.log(`Environment: $${ENVIRONMENT}`);
-    console.log(`Health check: http://localhost:$${PORT}/health`);
+    console.log(`OpenClaw Gateway listening on port ${PORT}`);
+    console.log(`Environment: ${ENVIRONMENT}`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
+    console.log(`React app: http://localhost:${PORT}`);
+    console.log(`API endpoints: http://localhost:${PORT}/api/*`);
 });
 EOF
 
-    # Create package.json
+    # Create package.json for full-stack app
     cat > package.json << 'EOF'
 {
   "name": "openclaw-gateway",
   "version": "1.0.0",
-  "description": "OpenClaw Gateway Service",
+  "description": "OpenClaw Gateway Service with React Frontend",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "dev": "nodemon app.js"
+    "dev": "nodemon app.js",
+    "build:frontend": "cd frontend && npm run build",
+    "install:frontend": "cd frontend && npm install"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "path": "^0.12.7"
   },
-  "keywords": ["openclaw", "gateway", "api"],
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  },
+  "keywords": ["openclaw", "gateway", "api", "react", "fullstack"],
   "author": "OpenClaw",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
 }
 EOF
 
-    # Install dependencies
+    # Install backend dependencies
     npm install
+    
 else
     # Handle specific versions here
     echo "Specific version deployment not implemented yet: $OPENCLAW_VERSION"

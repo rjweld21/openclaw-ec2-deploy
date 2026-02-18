@@ -104,19 +104,63 @@ output "health_check_url" {
   ) : "http://[EC2_PUBLIC_IP]:${var.openclaw_port}/health"
 }
 
+# Frontend Infrastructure Outputs
+output "frontend_s3_bucket_name" {
+  description = "Name of the S3 bucket hosting the frontend"
+  value       = aws_s3_bucket.frontend.id
+}
+
+output "frontend_s3_bucket_arn" {
+  description = "ARN of the S3 bucket hosting the frontend"
+  value       = aws_s3_bucket.frontend.arn
+}
+
+output "cloudfront_distribution_id" {
+  description = "ID of the CloudFront distribution"
+  value       = aws_cloudfront_distribution.frontend.id
+}
+
+output "cloudfront_distribution_arn" {
+  description = "ARN of the CloudFront distribution"
+  value       = aws_cloudfront_distribution.frontend.arn
+}
+
+output "cloudfront_domain_name" {
+  description = "Domain name of the CloudFront distribution"
+  value       = aws_cloudfront_distribution.frontend.domain_name
+}
+
+output "frontend_artifacts_bucket_name" {
+  description = "Name of the S3 bucket for frontend build artifacts"
+  value       = aws_s3_bucket.frontend_artifacts.id
+}
+
+# Updated Application URLs with CloudFront
+output "frontend_url" {
+  description = "URL to access the React frontend via CloudFront"
+  value       = "https://${aws_cloudfront_distribution.frontend.domain_name}"
+}
+
+output "api_url" {
+  description = "URL to access the API via CloudFront"
+  value       = "https://${aws_cloudfront_distribution.frontend.domain_name}/api"
+}
+
 # Deployment Information
 output "deployment_info" {
   description = "Key deployment information"
   value = {
-    environment          = var.environment
-    region              = var.aws_region
-    instance_type       = var.instance_type
-    min_instances       = var.min_size
-    max_instances       = var.max_size
-    desired_instances   = var.desired_capacity
+    environment            = var.environment
+    region                = var.aws_region
+    instance_type         = var.instance_type
+    min_instances         = var.min_size
+    max_instances         = var.max_size
+    desired_instances     = var.desired_capacity
     load_balancer_enabled = var.enable_load_balancer
-    monitoring_enabled   = var.enable_cloudwatch_monitoring
-    openclaw_version    = var.openclaw_version
-    openclaw_port       = var.openclaw_port
+    monitoring_enabled    = var.enable_cloudwatch_monitoring
+    openclaw_version      = var.openclaw_version
+    openclaw_port         = var.openclaw_port
+    frontend_enabled      = true
+    cloudfront_enabled    = true
   }
 }

@@ -435,13 +435,49 @@ jobs:
             # Capture outputs with error handling
             echo "=== Capturing Terraform Outputs ==="
             
-            # Application URL
+            # Backend Application URL
             if APPLICATION_URL=$(terraform output -raw application_url 2>/dev/null); then
               echo "application_url=$APPLICATION_URL" >> $GITHUB_OUTPUT
-              echo "Application URL: $APPLICATION_URL"
+              echo "Backend Application URL: $APPLICATION_URL"
             else
               echo "application_url=Not available" >> $GITHUB_OUTPUT
-              echo "⚠️ Application URL output not available"
+              echo "⚠️ Backend Application URL output not available"
+            fi
+            
+            # Frontend URL (CloudFront) - PRIMARY URL
+            if FRONTEND_URL=$(terraform output -raw frontend_url 2>/dev/null); then
+              echo "frontend_url=$FRONTEND_URL" >> $GITHUB_OUTPUT
+              echo "🎯 PRIMARY Frontend URL (CloudFront): $FRONTEND_URL"
+            else
+              echo "frontend_url=Not available" >> $GITHUB_OUTPUT
+              echo "⚠️ Frontend URL output not available"
+            fi
+            
+            # API URL (CloudFront)
+            if API_URL=$(terraform output -raw api_url 2>/dev/null); then
+              echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+              echo "API URL (CloudFront): $API_URL"
+            else
+              echo "api_url=Not available" >> $GITHUB_OUTPUT
+              echo "⚠️ API URL output not available"
+            fi
+            
+            # CloudFront Distribution ID
+            if CLOUDFRONT_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null); then
+              echo "cloudfront_distribution_id=$CLOUDFRONT_ID" >> $GITHUB_OUTPUT
+              echo "CloudFront Distribution ID: $CLOUDFRONT_ID"
+            else
+              echo "cloudfront_distribution_id=Not available" >> $GITHUB_OUTPUT
+              echo "⚠️ CloudFront Distribution ID not available"
+            fi
+            
+            # S3 Frontend Bucket
+            if S3_FRONTEND_BUCKET=$(terraform output -raw frontend_s3_bucket_name 2>/dev/null); then
+              echo "s3_frontend_bucket=$S3_FRONTEND_BUCKET" >> $GITHUB_OUTPUT
+              echo "S3 Frontend Bucket: $S3_FRONTEND_BUCKET"
+            else
+              echo "s3_frontend_bucket=Not available" >> $GITHUB_OUTPUT
+              echo "⚠️ S3 Frontend Bucket not available"
             fi
             
             # Load Balancer DNS
@@ -531,22 +567,20 @@ jobs:
           fi
 
       - name: Enhanced Deployment Health Check
-        if: steps.apply.outputs.application_url != 'Not available'
+        if: steps.apply.outputs.frontend_url != 'Not available'
         run: |
           echo "=== Enhanced Deployment Health Check ==="
           
+          FRONTEND_URL="${{ steps.apply.outputs.frontend_url }}"
+          API_URL="${{ steps.apply.outputs.api_url }}"
           APPLICATION_URL="${{ steps.apply.outputs.application_url }}"
           
-          # Extract base URL and construct health endpoint
-          if [[ "$APPLICATION_URL" == *"/health" ]]; then
-            HEALTH_URL="$APPLICATION_URL"
-            BASE_URL="${APPLICATION_URL%/health}"
-          else
-            BASE_URL="$APPLICATION_URL"
-            HEALTH_URL="${APPLICATION_URL}/health"
-          fi
+          echo "🎯 Primary Frontend URL: $FRONTEND_URL"
+          echo "🔗 API URL: $API_URL"
+          echo "⚙️ Backend URL: $APPLICATION_URL"
           
-          echo "Base URL: $BASE_URL"
+          # Test URLs
+          HEALTH_URL="${API_URL}/status"
           echo "Health Check URL: $HEALTH_URL"
           
           # Enhanced health checking with retries
@@ -559,25 +593,39 @@ jobs:
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "=== Attempt $ATTEMPT/$MAX_ATTEMPTS ==="
             
-            # Check health endpoint
-            if curl -sf --max-time 10 "$HEALTH_URL" > /tmp/health_response.json 2>/tmp/curl_error.txt; then
-              echo "✅ Health check successful!"
-              echo "Response:"
-              cat /tmp/health_response.json | jq '.' 2>/dev/null || cat /tmp/health_response.json
-              HEALTH_SUCCESS=true
-              break
-            else
-              echo "❌ Health check failed"
-              if [ -f /tmp/curl_error.txt ]; then
-                echo "Curl error: $(cat /tmp/curl_error.txt)"
-              fi
-              
-              # Additional diagnostics for troubleshooting
-              echo "Attempting basic connectivity test..."
-              if curl -I --max-time 5 "$BASE_URL" >/dev/null 2>&1; then
-                echo "✓ Basic connectivity OK, but health endpoint not ready"
+            # Test Frontend (React App)
+            echo "Testing Frontend (React App)..."
+            if curl -sf --max-time 10 "$FRONTEND_URL" > /tmp/frontend_response.html 2>/tmp/frontend_error.txt; then
+              echo "✅ Frontend accessible!"
+              if grep -q "OpenClaw Gateway" /tmp/frontend_response.html; then
+                echo "✅ Frontend content verified - React app is loading!"
               else
-                echo "✗ No connectivity to base URL"
+                echo "⚠️ Frontend accessible but content may not be complete"
+              fi
+            else
+              echo "❌ Frontend check failed"
+              if [ -f /tmp/frontend_error.txt ]; then
+                echo "Frontend error: $(cat /tmp/frontend_error.txt)"
+              fi
+            fi
+            
+            # Test API endpoint
+            echo "Testing API endpoint..."
+            if curl -sf --max-time 10 "$HEALTH_URL" > /tmp/health_response.json 2>/tmp/curl_error.txt; then
+              echo "✅ API health check successful!"
+              echo "API Response:"
+              cat /tmp/health_response.json | jq '.' 2>/dev/null || cat /tmp/health_response.json
+              
+              # If both frontend and API are working, we're good
+              if curl -sf --max-time 5 "$FRONTEND_URL" >/dev/null 2>&1; then
+                echo "🎉 Both Frontend and API are working!"
+                HEALTH_SUCCESS=true
+                break
+              fi
+            else
+              echo "❌ API health check failed"
+              if [ -f /tmp/curl_error.txt ]; then
+                echo "API error: $(cat /tmp/curl_error.txt)"
               fi
             fi
             
@@ -618,15 +666,23 @@ jobs:
           **Region:** ${{ env.AWS_DEFAULT_REGION }}  
           **Status:** ${{ job.status }}  
           **Commit:** ${{ github.sha }}  
-          **Workflow:** Enhanced CI/CD Pipeline
+          **Workflow:** Enhanced CI/CD Pipeline with React Frontend
+          
+          ## 🎯 PRIMARY ACCESS POINTS
+          
+          | Service | URL |
+          |---------|-----|
+          | 🌐 **React Frontend** | ${{ steps.apply.outputs.frontend_url }} |
+          | 🔗 **API Endpoint** | ${{ steps.apply.outputs.api_url }} |
+          | ⚙️ **Backend (Direct)** | ${{ steps.apply.outputs.application_url }} |
           
           ## 📊 Infrastructure Details
           
           | Resource | Value |
           |----------|-------|
-          | Application URL | ${{ steps.apply.outputs.application_url }} |
+          | CloudFront Distribution | ${{ steps.apply.outputs.cloudfront_distribution_id }} |
+          | S3 Frontend Bucket | ${{ steps.apply.outputs.s3_frontend_bucket }} |
           | Load Balancer DNS | ${{ steps.apply.outputs.load_balancer_dns }} |
-          | Health Check URL | ${{ steps.apply.outputs.application_url }}/health |
           | VPC ID | ${{ steps.apply.outputs.vpc_id }} |
           | Security Group ID | ${{ steps.apply.outputs.security_group_id }} |
           
