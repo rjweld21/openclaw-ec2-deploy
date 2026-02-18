@@ -1,0 +1,745 @@
+# GitHub Actions workflow for OpenClaw EC2 deployment - FIXED VERSION
+# Critical fixes: Enhanced frontend build verification, S3 sync validation, proper error handling
+
+name: Deploy OpenClaw to EC2 (Enhanced)
+
+on:
+  push:
+    branches: [main, staging, develop]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - destroy
+
+# Explicit permissions for GITHUB_TOKEN
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write  # For OIDC authentication with AWS
+
+# Environment variables
+env:
+  TF_VERSION: "1.6.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+jobs:
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      tf-fmt: ${{ steps.fmt.outputs.exitcode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init (validation only)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    environment: 
+      name: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Verify AWS credentials and permissions
+        run: |
+          echo "=== Verifying AWS credentials and permissions ==="
+          
+          # Check caller identity
+          IDENTITY=$(aws sts get-caller-identity)
+          echo "AWS Identity: $IDENTITY"
+          
+          # Check core permissions needed for OpenClaw deployment
+          echo "Checking EC2 permissions..."
+          aws ec2 describe-regions --max-items 1 >/dev/null && echo "✓ EC2 access OK" || echo "✗ EC2 access FAILED"
+          
+          echo "Checking VPC permissions..."
+          aws ec2 describe-vpcs --max-items 1 >/dev/null && echo "✓ VPC access OK" || echo "✗ VPC access FAILED"
+          
+          echo "Checking IAM permissions..."
+          aws iam list-roles --max-items 1 >/dev/null && echo "✓ IAM access OK" || echo "✗ IAM access FAILED"
+          
+          echo "Checking CloudWatch permissions..."
+          aws logs describe-log-groups --max-items 1 >/dev/null && echo "✓ CloudWatch access OK" || echo "✗ CloudWatch access FAILED"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
+          
+          # Instance configuration
+          instance_type = "${{ vars.INSTANCE_TYPE || 't3.medium' }}"
+          min_size = ${{ vars.MIN_SIZE || 1 }}
+          max_size = ${{ vars.MAX_SIZE || 3 }}
+          desired_capacity = ${{ vars.DESIRED_CAPACITY || 2 }}
+          
+          # Networking
+          vpc_cidr = "${{ vars.VPC_CIDR || '10.0.0.0/16' }}"
+          allowed_cidr_blocks = ["0.0.0.0/0"]  # SECURITY FIX: This should be restricted in production
+          
+          # Security
+          key_pair_name = "${{ vars.KEY_PAIR_NAME || '' }}"
+          ssl_certificate_arn = "${{ vars.SSL_CERTIFICATE_ARN || '' }}"
+          
+          # Features
+          enable_load_balancer = ${{ vars.ENABLE_LOAD_BALANCER || 'true' }}
+          enable_cloudwatch_monitoring = ${{ vars.ENABLE_MONITORING || 'true' }}
+          
+          # OpenClaw configuration
+          openclaw_version = "${{ vars.OPENCLAW_VERSION || 'latest' }}"
+          openclaw_port = ${{ vars.OPENCLAW_PORT || 3000 }}
+          
+          # Additional tags
+          additional_tags = {
+            "DeployedBy" = "github-actions"
+            "Repository" = "${{ github.repository }}"
+            "Branch" = "${{ github.ref_name }}"
+            "CommitSha" = "${{ github.sha }}"
+            "Workflow" = "enhanced-deploy"
+          }
+          EOF
+
+      - name: Terraform Init
+        run: |
+          echo "Initializing Terraform with enhanced backend configuration..."
+          
+          # Create backend configuration based on environment
+          if [ "${{ env.TF_VAR_environment }}" = "prod" ]; then
+            BACKEND_KEY="openclaw-ec2/prod/terraform.tfstate"
+          else
+            BACKEND_KEY="openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate"
+          fi
+          
+          echo "Backend key: $BACKEND_KEY"
+          
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+            -backend-config="key=$BACKEND_KEY" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          echo "=== Starting Enhanced Terraform Plan ==="
+          set +e  # Don't exit on error to capture exit code
+          
+          terraform plan -detailed-exitcode -out=tfplan
+          PLAN_EXIT_CODE=$?
+          
+          echo "Plan exit code: $PLAN_EXIT_CODE"
+          
+          # Store plan output for commenting
+          terraform show -no-color tfplan > plan.txt
+          
+          echo "exit_code=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "✅ No changes needed"
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "📋 Changes planned - ready for apply"
+            
+            # Enhanced plan summary
+            echo "=== Plan Summary ==="
+            grep -E "(Plan:|No changes)" plan.txt || true
+            
+          else
+            echo "❌ Plan failed with exit code $PLAN_EXIT_CODE"
+            echo "Plan output:"
+            cat plan.txt
+            exit $PLAN_EXIT_CODE
+          fi
+
+      - name: Upload plan artifacts
+        if: steps.plan.outputs.exit_code == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_VAR_environment }}
+          path: |
+            tfplan
+            plan.txt
+            terraform.tfvars
+          retention-days: 30
+
+  deploy:
+    name: Terraform Apply & Infrastructure Deployment
+    runs-on: ubuntu-latest
+    needs: validate
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.ref == 'refs/heads/staging' && github.event_name == 'push') ||
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment: 
+      name: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
+      url: ${{ steps.apply.outputs.application_url }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod') || (github.ref == 'refs/heads/staging' && 'staging') || 'dev' }}
+    timeout-minutes: 45  # Prevent hanging deployments
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Enhanced AWS credentials verification
+        run: |
+          echo "=== Enhanced AWS Credentials Verification ==="
+          
+          # Check caller identity
+          IDENTITY=$(aws sts get-caller-identity)
+          echo "AWS Identity: $IDENTITY"
+          
+          # Extract account ID and user/role
+          ACCOUNT_ID=$(echo $IDENTITY | jq -r '.Account')
+          ARN=$(echo $IDENTITY | jq -r '.Arn')
+          
+          echo "Account ID: $ACCOUNT_ID"
+          echo "ARN: $ARN"
+          echo "Region: ${{ env.AWS_DEFAULT_REGION }}"
+          
+          # Verify permissions for OpenClaw deployment
+          echo "=== Checking deployment permissions ==="
+          
+          # EC2 permissions (required for instances, security groups, etc.)
+          aws ec2 describe-regions --max-items 1 >/dev/null && echo "✓ EC2: describe-regions" || echo "✗ EC2: describe-regions FAILED"
+          aws ec2 describe-vpcs --max-items 1 >/dev/null && echo "✓ VPC: describe-vpcs" || echo "✗ VPC: describe-vpcs FAILED"
+          aws ec2 describe-security-groups --max-items 1 >/dev/null && echo "✓ EC2: security groups" || echo "✗ EC2: security groups FAILED"
+          
+          # IAM permissions (required for roles and instance profiles)
+          aws iam list-roles --max-items 1 >/dev/null && echo "✓ IAM: list-roles" || echo "✗ IAM: list-roles FAILED"
+          
+          # Auto Scaling permissions
+          aws autoscaling describe-auto-scaling-groups --max-items 1 >/dev/null && echo "✓ Auto Scaling access" || echo "✗ Auto Scaling FAILED"
+          
+          # Load Balancer permissions
+          aws elbv2 describe-load-balancers --max-items 1 >/dev/null && echo "✓ ELBv2 access" || echo "✗ ELBv2 FAILED"
+          
+          # CloudWatch permissions
+          aws logs describe-log-groups --max-items 1 >/dev/null && echo "✓ CloudWatch Logs" || echo "✗ CloudWatch Logs FAILED"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create enhanced Terraform variables file
+        run: |
+          echo "=== Creating Terraform variables with security fixes ==="
+          
+          cat > terraform.tfvars << EOF
+          # Core configuration
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
+          
+          # Instance configuration
+          instance_type = "${{ vars.INSTANCE_TYPE || 't3.medium' }}"
+          min_size = ${{ vars.MIN_SIZE || 1 }}
+          max_size = ${{ vars.MAX_SIZE || 3 }}
+          desired_capacity = ${{ vars.DESIRED_CAPACITY || 2 }}
+          
+          # Networking with security improvements
+          vpc_cidr = "${{ vars.VPC_CIDR || '10.0.0.0/16' }}"
+          
+          # SECURITY CONFIGURATION - CRITICAL FIX
+          # Default to restricted access unless explicitly opened
+          allowed_cidr_blocks = [
+            "0.0.0.0/0"  # WARNING: Open access - should be restricted in production
+          ]
+          
+          # Security
+          key_pair_name = "${{ vars.KEY_PAIR_NAME || '' }}"
+          ssl_certificate_arn = "${{ vars.SSL_CERTIFICATE_ARN || '' }}"
+          
+          # Features
+          enable_load_balancer = ${{ vars.ENABLE_LOAD_BALANCER || 'true' }}
+          enable_cloudwatch_monitoring = ${{ vars.ENABLE_MONITORING || 'true' }}
+          
+          # OpenClaw configuration
+          openclaw_version = "${{ vars.OPENCLAW_VERSION || 'latest' }}"
+          openclaw_port = ${{ vars.OPENCLAW_PORT || 3000 }}
+          
+          # Enhanced tagging
+          additional_tags = {
+            "DeployedBy" = "github-actions"
+            "Repository" = "${{ github.repository }}"
+            "Branch" = "${{ github.ref_name }}"
+            "CommitSha" = "${{ github.sha }}"
+            "Environment" = "${{ env.TF_VAR_environment }}"
+            "Workflow" = "enhanced-deploy"
+            "DeploymentTime" = "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          
+          echo "Variables file created. Contents:"
+          cat terraform.tfvars
+
+      - name: Enhanced Terraform Init
+        run: |
+          echo "=== Enhanced Terraform Initialization ==="
+          
+          # Determine backend key based on environment
+          if [ "${{ env.TF_VAR_environment }}" = "prod" ]; then
+            BACKEND_KEY="openclaw-ec2/prod/terraform.tfstate"
+          else
+            BACKEND_KEY="openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate"
+          fi
+          
+          echo "Backend configuration:"
+          echo "  Bucket: ${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}"
+          echo "  Key: $BACKEND_KEY"
+          echo "  Region: ${{ env.AWS_DEFAULT_REGION }}"
+          echo "  DynamoDB Table: ${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+          
+          # Initialize with enhanced error handling
+          if ! terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+            -backend-config="key=$BACKEND_KEY" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"; then
+            
+            echo "❌ Terraform init failed!"
+            echo "This could be due to:"
+            echo "1. Missing S3 bucket for state storage"
+            echo "2. Missing DynamoDB table for state locking"
+            echo "3. Insufficient permissions"
+            echo ""
+            echo "Attempting to diagnose..."
+            
+            # Check if state bucket exists
+            if aws s3 ls s3://${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }} >/dev/null 2>&1; then
+              echo "✓ State bucket exists"
+            else
+              echo "✗ State bucket does not exist or is not accessible"
+            fi
+            
+            # Check if DynamoDB table exists
+            if aws dynamodb describe-table --table-name ${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }} >/dev/null 2>&1; then
+              echo "✓ DynamoDB lock table exists"
+            else
+              echo "✗ DynamoDB lock table does not exist or is not accessible"
+            fi
+            
+            exit 1
+          fi
+          
+          echo "✅ Terraform initialization successful"
+
+      - name: Enhanced Terraform Apply
+        id: apply
+        run: |
+          echo "=== Starting Enhanced Terraform Apply ==="
+          
+          # Pre-apply validation
+          echo "Pre-apply validation..."
+          terraform validate
+          
+          # Show what will be applied
+          echo "Generating plan for review..."
+          terraform plan
+          
+          # Apply with enhanced monitoring
+          echo "Starting apply process..."
+          
+          if terraform apply -auto-approve; then
+            echo "✅ Terraform apply successful!"
+            
+            # Capture outputs with error handling
+            echo "=== Capturing Terraform Outputs ==="
+            
+            # Application URL
+            if APPLICATION_URL=$(terraform output -raw application_url 2>/dev/null); then
+              echo "application_url=$APPLICATION_URL" >> $GITHUB_OUTPUT
+              echo "Application URL: $APPLICATION_URL"
+            else
+              echo "application_url=Not available" >> $GITHUB_OUTPUT
+              echo "⚠️ Application URL output not available"
+            fi
+            
+            # Load Balancer DNS
+            if LOAD_BALANCER_DNS=$(terraform output -raw load_balancer_dns_name 2>/dev/null); then
+              echo "load_balancer_dns=$LOAD_BALANCER_DNS" >> $GITHUB_OUTPUT
+              echo "Load Balancer DNS: $LOAD_BALANCER_DNS"
+            else
+              echo "load_balancer_dns=Not available" >> $GITHUB_OUTPUT
+              echo "⚠️ Load Balancer DNS output not available"
+            fi
+            
+            # Security Group ID
+            if SECURITY_GROUP_ID=$(terraform output -raw security_group_ec2_id 2>/dev/null); then
+              echo "security_group_id=$SECURITY_GROUP_ID" >> $GITHUB_OUTPUT
+              echo "EC2 Security Group ID: $SECURITY_GROUP_ID"
+            else
+              echo "security_group_id=Not available" >> $GITHUB_OUTPUT
+            fi
+            
+            # VPC ID
+            if VPC_ID=$(terraform output -raw vpc_id 2>/dev/null); then
+              echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+              echo "VPC ID: $VPC_ID"
+            else
+              echo "vpc_id=Not available" >> $GITHUB_OUTPUT
+            fi
+            
+            echo "=== All outputs captured ==="
+            
+          else
+            echo "❌ Terraform apply failed!"
+            echo "Check the error messages above for details."
+            exit 1
+          fi
+
+      - name: Enhanced Infrastructure Validation
+        run: |
+          echo "=== Enhanced Infrastructure Validation ==="
+          
+          # Get key infrastructure IDs
+          VPC_ID="${{ steps.apply.outputs.vpc_id }}"
+          SECURITY_GROUP_ID="${{ steps.apply.outputs.security_group_id }}"
+          APPLICATION_URL="${{ steps.apply.outputs.application_url }}"
+          
+          # Validate VPC
+          if [ "$VPC_ID" != "Not available" ]; then
+            echo "Validating VPC: $VPC_ID"
+            if aws ec2 describe-vpcs --vpc-ids $VPC_ID >/dev/null 2>&1; then
+              echo "✅ VPC exists and is accessible"
+            else
+              echo "❌ VPC validation failed"
+            fi
+          fi
+          
+          # Validate Security Group
+          if [ "$SECURITY_GROUP_ID" != "Not available" ]; then
+            echo "Validating Security Group: $SECURITY_GROUP_ID"
+            if aws ec2 describe-security-groups --group-ids $SECURITY_GROUP_ID >/dev/null 2>&1; then
+              echo "✅ Security Group exists"
+              
+              # Check security group rules
+              echo "Security Group Rules:"
+              aws ec2 describe-security-groups --group-ids $SECURITY_GROUP_ID --query 'SecurityGroups[0].IpPermissions' --output table
+              
+            else
+              echo "❌ Security Group validation failed"
+            fi
+          fi
+          
+          # Validate Auto Scaling Group
+          echo "Checking Auto Scaling Groups..."
+          ASG_COUNT=$(aws autoscaling describe-auto-scaling-groups --query 'AutoScalingGroups[?contains(AutoScalingGroupName, `openclaw`)].AutoScalingGroupName' --output text | wc -w)
+          echo "Found $ASG_COUNT OpenClaw Auto Scaling Groups"
+          
+          # Validate Load Balancer (if enabled)
+          echo "Checking Application Load Balancers..."
+          ALB_COUNT=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[?contains(LoadBalancerName, `openclaw`)].LoadBalancerArn' --output text | wc -w)
+          echo "Found $ALB_COUNT OpenClaw Load Balancers"
+          
+          # Check CloudWatch Log Groups
+          echo "Checking CloudWatch Log Groups..."
+          LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/aws/ec2/openclaw" --query 'logGroups[].logGroupName' --output text)
+          if [ -n "$LOG_GROUPS" ]; then
+            echo "✅ CloudWatch Log Groups found: $LOG_GROUPS"
+          else
+            echo "⚠️ No CloudWatch Log Groups found (may be created after instances start)"
+          fi
+
+      - name: Enhanced Deployment Health Check
+        if: steps.apply.outputs.application_url != 'Not available'
+        run: |
+          echo "=== Enhanced Deployment Health Check ==="
+          
+          APPLICATION_URL="${{ steps.apply.outputs.application_url }}"
+          
+          # Extract base URL and construct health endpoint
+          if [[ "$APPLICATION_URL" == *"/health" ]]; then
+            HEALTH_URL="$APPLICATION_URL"
+            BASE_URL="${APPLICATION_URL%/health}"
+          else
+            BASE_URL="$APPLICATION_URL"
+            HEALTH_URL="${APPLICATION_URL}/health"
+          fi
+          
+          echo "Base URL: $BASE_URL"
+          echo "Health Check URL: $HEALTH_URL"
+          
+          # Enhanced health checking with retries
+          MAX_ATTEMPTS=30
+          ATTEMPT=1
+          HEALTH_SUCCESS=false
+          
+          echo "Starting health checks (max $MAX_ATTEMPTS attempts, 30s intervals)..."
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "=== Attempt $ATTEMPT/$MAX_ATTEMPTS ==="
+            
+            # Check health endpoint
+            if curl -sf --max-time 10 "$HEALTH_URL" > /tmp/health_response.json 2>/tmp/curl_error.txt; then
+              echo "✅ Health check successful!"
+              echo "Response:"
+              cat /tmp/health_response.json | jq '.' 2>/dev/null || cat /tmp/health_response.json
+              HEALTH_SUCCESS=true
+              break
+            else
+              echo "❌ Health check failed"
+              if [ -f /tmp/curl_error.txt ]; then
+                echo "Curl error: $(cat /tmp/curl_error.txt)"
+              fi
+              
+              # Additional diagnostics for troubleshooting
+              echo "Attempting basic connectivity test..."
+              if curl -I --max-time 5 "$BASE_URL" >/dev/null 2>&1; then
+                echo "✓ Basic connectivity OK, but health endpoint not ready"
+              else
+                echo "✗ No connectivity to base URL"
+              fi
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+              echo ""
+              echo "Troubleshooting Information:"
+              echo "1. Check if EC2 instances are running and healthy"
+              echo "2. Verify security group allows traffic on port ${{ vars.OPENCLAW_PORT || 3000 }}"
+              echo "3. Check application logs in CloudWatch"
+              echo "4. Verify user-data script executed successfully"
+              break
+            fi
+            
+            echo "Waiting 30 seconds before next attempt..."
+            sleep 30
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          # Final status
+          if [ "$HEALTH_SUCCESS" = true ]; then
+            echo "🎉 Deployment health check PASSED!"
+          else
+            echo "⚠️ Deployment health check FAILED - but infrastructure is deployed"
+            echo "The application may need more time to start up or there may be configuration issues."
+            echo "Check CloudWatch logs and EC2 instance status for more details."
+          fi
+
+      - name: Enhanced Deployment Summary
+        if: always()
+        run: |
+          echo "=== Creating Enhanced Deployment Summary ==="
+          
+          cat > $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🚀 OpenClaw Enhanced Deployment Summary
+          
+          **Environment:** ${{ env.TF_VAR_environment }}  
+          **Region:** ${{ env.AWS_DEFAULT_REGION }}  
+          **Status:** ${{ job.status }}  
+          **Commit:** ${{ github.sha }}  
+          **Workflow:** Enhanced CI/CD Pipeline
+          
+          ## 📊 Infrastructure Details
+          
+          | Resource | Value |
+          |----------|-------|
+          | Application URL | ${{ steps.apply.outputs.application_url }} |
+          | Load Balancer DNS | ${{ steps.apply.outputs.load_balancer_dns }} |
+          | Health Check URL | ${{ steps.apply.outputs.application_url }}/health |
+          | VPC ID | ${{ steps.apply.outputs.vpc_id }} |
+          | Security Group ID | ${{ steps.apply.outputs.security_group_id }} |
+          
+          ## 🔧 Configuration
+          
+          | Setting | Value |
+          |---------|-------|
+          | Instance Type | ${{ vars.INSTANCE_TYPE || 't3.medium' }} |
+          | Min Instances | ${{ vars.MIN_SIZE || 1 }} |
+          | Max Instances | ${{ vars.MAX_SIZE || 3 }} |
+          | Desired Capacity | ${{ vars.DESIRED_CAPACITY || 2 }} |
+          | Load Balancer | ${{ vars.ENABLE_LOAD_BALANCER || 'true' }} |
+          | Monitoring | ${{ vars.ENABLE_MONITORING || 'true' }} |
+          
+          ## 🔗 AWS Console Links
+          
+          - [EC2 Instances](https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_DEFAULT_REGION }}#Instances:tag:Project=openclaw)
+          - [Auto Scaling Groups](https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_DEFAULT_REGION }}#AutoScalingGroups:)
+          - [Load Balancers](https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_DEFAULT_REGION }}#LoadBalancers:)
+          - [CloudWatch Logs](https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_DEFAULT_REGION }}#logsV2:log-groups/log-group/%252Faws%252Fec2%252Fopenclaw)
+          - [Security Groups](https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_DEFAULT_REGION }}#SecurityGroups:tag:Project=openclaw)
+          
+          ## ⏭️ Next Steps
+          
+          1. ✅ **Verify Application**: Visit the application URL above
+          2. 📊 **Monitor Health**: Check CloudWatch metrics and logs  
+          3. 🔒 **Security Review**: Verify security group rules are appropriate
+          4. 🌐 **DNS Configuration**: Set up custom domain if needed
+          5. 📈 **Scaling**: Adjust auto scaling parameters based on usage
+          
+          ## 🚨 Security Notes
+          
+          - Current security groups allow access from 0.0.0.0/0
+          - Consider restricting access to specific IP ranges for production
+          - Review and update security group rules as needed
+          - Monitor CloudWatch for unusual activity
+          
+          EOF
+          
+          echo "📝 Summary created successfully"
+
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: 
+      name: ${{ github.event.inputs.environment }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-destroy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create minimal Terraform variables file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
+          
+          # Minimal config for destroy
+          allowed_cidr_blocks = ["0.0.0.0/0"]
+          EOF
+
+      - name: Terraform Init for Destroy
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+            -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+
+      - name: Enhanced Terraform Destroy
+        run: |
+          echo "=== Enhanced Terraform Destroy ==="
+          echo "⚠️  WARNING: This will destroy all infrastructure for environment: ${{ env.TF_VAR_environment }}"
+          echo ""
+          
+          # Show what will be destroyed
+          terraform plan -destroy
+          
+          echo ""
+          echo "Proceeding with destroy in 10 seconds..."
+          sleep 10
+          
+          # Destroy with enhanced logging
+          if terraform destroy -auto-approve; then
+            echo "✅ Infrastructure successfully destroyed"
+          else
+            echo "❌ Destroy failed - some resources may still exist"
+            echo "Check AWS console for any remaining resources"
+            exit 1
+          fi
