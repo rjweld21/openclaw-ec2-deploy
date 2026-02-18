@@ -1,282 +1,223 @@
 #!/bin/bash
-# OpenClaw EC2 Deployment - Monitoring and Health Check Script
 
-set -e
+# Enhanced GitHub Actions Monitoring Script for OpenClaw EC2 Deployment
+# This script monitors the CI/CD pipeline status and infrastructure deployment
+
+set -euo pipefail
+
+echo "🚀 OpenClaw CI/CD Pipeline Monitor"
+echo "=================================="
+echo "Monitoring deployment status..."
+echo ""
 
 # Configuration
-HEALTH_TIMEOUT=10
-LOG_FILE="deployment-monitor.log"
-CHECK_INTERVAL=30
+REPO_NAME="rjweld21/openclaw-ec2-deploy"
+AWS_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
-}
-
-print_status() {
-    echo -e "${BLUE}$1${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}✅ $1${NC}"
-}
-
-print_error() {
-    echo -e "${RED}❌ $1${NC}"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠️  $1${NC}"
-}
-
-get_load_balancer_dns() {
-    local dns_name=""
+# Function to check GitHub Actions status
+check_github_actions() {
+    echo "📊 GitHub Actions Status:"
+    echo "------------------------"
     
-    # Try to get from Terraform output
-    if [ -f "../infrastructure/terraform.tfstate" ]; then
-        dns_name=$(terraform -chdir=../infrastructure output -raw load_balancer_dns 2>/dev/null || echo "")
-    fi
-    
-    # If not available, prompt user
-    if [ -z "$dns_name" ]; then
-        read -p "Enter your load balancer DNS name: " dns_name
-    fi
-    
-    echo "$dns_name"
-}
-
-check_health() {
-    local url="$1"
-    local timeout="${2:-$HEALTH_TIMEOUT}"
-    
-    if curl -f -s --max-time "$timeout" "$url/health" > /dev/null 2>&1; then
-        return 0
+    # Check if GitHub CLI is available
+    if command -v gh &> /dev/null; then
+        echo "Using GitHub CLI to check workflow status..."
+        gh run list --repo $REPO_NAME --limit 3 --json status,conclusion,workflowName,createdAt,url
     else
-        return 1
+        echo "⚠️ GitHub CLI not available. Please check workflow status manually at:"
+        echo "   https://github.com/$REPO_NAME/actions"
     fi
+    echo ""
 }
 
-check_openclaw_gateway() {
-    local url="$1"
-    local timeout="${2:-$HEALTH_TIMEOUT}"
+# Function to check AWS infrastructure
+check_aws_infrastructure() {
+    echo "🏗️ AWS Infrastructure Status:"
+    echo "-----------------------------"
     
-    # Try to access the main OpenClaw endpoint
-    local response=$(curl -s --max-time "$timeout" -w "%{http_code}" -o /dev/null "$url" 2>/dev/null || echo "000")
-    
-    # OpenClaw typically returns 401 for unauthenticated requests, which is expected
-    if [ "$response" = "401" ] || [ "$response" = "200" ]; then
-        return 0
-    else
-        return 1
+    # Check if AWS CLI is available
+    if ! command -v aws &> /dev/null; then
+        echo "❌ AWS CLI not available. Cannot check infrastructure status."
+        return
     fi
+    
+    # Check AWS credentials
+    if ! aws sts get-caller-identity &> /dev/null; then
+        echo "❌ AWS credentials not configured. Cannot check infrastructure status."
+        return
+    fi
+    
+    echo "✅ AWS CLI configured. Checking infrastructure..."
+    
+    # Check for OpenClaw VPCs
+    echo "🌐 VPC Status:"
+    VPC_COUNT=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=openclaw" --query 'Vpcs' --output json | jq length)
+    echo "   OpenClaw VPCs found: $VPC_COUNT"
+    
+    # Check for OpenClaw security groups
+    echo "🔒 Security Groups:"
+    SG_COUNT=$(aws ec2 describe-security-groups --filters "Name=tag:Project,Values=openclaw" --query 'SecurityGroups' --output json | jq length)
+    echo "   OpenClaw Security Groups: $SG_COUNT"
+    
+    if [ $SG_COUNT -gt 0 ]; then
+        echo "   Security Group Details:"
+        aws ec2 describe-security-groups \
+            --filters "Name=tag:Project,Values=openclaw" \
+            --query 'SecurityGroups[*].{GroupId:GroupId,GroupName:GroupName,Description:Description}' \
+            --output table
+    fi
+    
+    # Check for OpenClaw EC2 instances
+    echo "💻 EC2 Instances:"
+    INSTANCE_COUNT=$(aws ec2 describe-instances --filters "Name=tag:Project,Values=openclaw" "Name=instance-state-name,Values=running,pending,stopping,stopped" --query 'Reservations[*].Instances' --output json | jq '[.[]] | length')
+    echo "   OpenClaw Instances: $INSTANCE_COUNT"
+    
+    if [ $INSTANCE_COUNT -gt 0 ]; then
+        echo "   Instance Details:"
+        aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=openclaw" "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,Type:InstanceType,PublicIP:PublicIpAddress}' \
+            --output table
+    fi
+    
+    # Check for Load Balancers
+    echo "⚖️ Load Balancers:"
+    ALB_COUNT=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[?contains(LoadBalancerName, `openclaw`)]' --output json | jq length)
+    echo "   OpenClaw Load Balancers: $ALB_COUNT"
+    
+    if [ $ALB_COUNT -gt 0 ]; then
+        echo "   Load Balancer Details:"
+        aws elbv2 describe-load-balancers \
+            --query 'LoadBalancers[?contains(LoadBalancerName, `openclaw`)].{Name:LoadBalancerName,DNS:DNSName,State:State.Code}' \
+            --output table
+    fi
+    
+    # Check Auto Scaling Groups
+    echo "📈 Auto Scaling Groups:"
+    ASG_COUNT=$(aws autoscaling describe-auto-scaling-groups --query 'AutoScalingGroups[?contains(AutoScalingGroupName, `openclaw`)]' --output json | jq length)
+    echo "   OpenClaw ASGs: $ASG_COUNT"
+    
+    if [ $ASG_COUNT -gt 0 ]; then
+        echo "   ASG Details:"
+        aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[?contains(AutoScalingGroupName, `openclaw`)].{Name:AutoScalingGroupName,MinSize:MinSize,MaxSize:MaxSize,DesiredCapacity:DesiredCapacity,HealthCheckType:HealthCheckType}' \
+            --output table
+    fi
+    
+    echo ""
 }
 
-check_ssl() {
-    local domain="$1"
+# Function to check application health
+check_application_health() {
+    echo "🏥 Application Health Status:"
+    echo "----------------------------"
     
-    if [ -z "$domain" ]; then
-        return 0  # Skip SSL check if no domain
-    fi
-    
-    if echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null | openssl x509 -noout -dates 2>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-get_instance_metrics() {
-    local instance_id="$1"
-    
-    if [ -z "$instance_id" ]; then
-        echo "No instance ID provided"
-        return 1
-    fi
-    
-    # Get instance status
-    local instance_state=$(aws ec2 describe-instances \
-        --instance-ids "$instance_id" \
-        --query 'Reservations[0].Instances[0].State.Name' \
-        --output text 2>/dev/null || echo "unknown")
-    
-    echo "Instance State: $instance_state"
-    
-    # Get basic CloudWatch metrics if available
-    local cpu_utilization=$(aws cloudwatch get-metric-statistics \
-        --namespace AWS/EC2 \
-        --metric-name CPUUtilization \
-        --dimensions Name=InstanceId,Value="$instance_id" \
-        --start-time "$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S)" \
-        --end-time "$(date -u +%Y-%m-%dT%H:%M:%S)" \
-        --period 300 \
-        --statistics Average \
-        --query 'Datapoints[0].Average' \
-        --output text 2>/dev/null || echo "N/A")
-    
-    if [ "$cpu_utilization" != "N/A" ] && [ "$cpu_utilization" != "None" ]; then
-        echo "CPU Utilization: ${cpu_utilization}%"
-    fi
-}
-
-monitor_deployment() {
-    local lb_dns="$1"
-    local domain="$2"
-    local continuous="${3:-false}"
-    
-    print_status "🔍 Starting OpenClaw deployment monitoring..."
-    log "Starting monitoring for $lb_dns"
-    
-    while true; do
-        echo ""
-        echo "=============================="
-        echo "Health Check - $(date)"
-        echo "=============================="
+    # Get Load Balancer DNS
+    if command -v aws &> /dev/null && aws sts get-caller-identity &> /dev/null; then
+        ALB_DNS=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[?contains(LoadBalancerName, `openclaw`)].DNSName' --output text 2>/dev/null || echo "")
         
-        # Check load balancer health endpoint
-        print_status "Checking load balancer health..."
-        if check_health "http://$lb_dns"; then
-            print_success "Load balancer health check passed"
-            log "Load balancer health check: PASS"
-        else
-            print_error "Load balancer health check failed"
-            log "Load balancer health check: FAIL"
-        fi
-        
-        # Check OpenClaw Gateway
-        print_status "Checking OpenClaw Gateway..."
-        if check_openclaw_gateway "http://$lb_dns"; then
-            print_success "OpenClaw Gateway is responding"
-            log "OpenClaw Gateway check: PASS"
-        else
-            print_error "OpenClaw Gateway is not responding properly"
-            log "OpenClaw Gateway check: FAIL"
-        fi
-        
-        # Check SSL if domain provided
-        if [ -n "$domain" ]; then
-            print_status "Checking SSL certificate..."
-            if check_ssl "$domain"; then
-                print_success "SSL certificate is valid"
-                log "SSL certificate check: PASS"
-            else
-                print_error "SSL certificate check failed"
-                log "SSL certificate check: FAIL"
-            fi
-        fi
-        
-        # Get AWS instance information if available
-        if command -v aws &> /dev/null; then
-            print_status "Checking AWS instance metrics..."
+        if [ -n "$ALB_DNS" ]; then
+            echo "🌐 Testing Load Balancer: http://$ALB_DNS"
             
-            # Try to get instance ID from tags
-            local instance_id=$(aws ec2 describe-instances \
-                --filters "Name=tag:Name,Values=openclaw-gateway" \
-                          "Name=instance-state-name,Values=running" \
-                --query 'Reservations[0].Instances[0].InstanceId' \
-                --output text 2>/dev/null || echo "")
-            
-            if [ -n "$instance_id" ] && [ "$instance_id" != "None" ]; then
-                get_instance_metrics "$instance_id"
+            # Test basic connectivity
+            if curl -f --max-time 10 "http://$ALB_DNS" > /dev/null 2>&1; then
+                echo "✅ Base URL responding"
             else
-                echo "Could not find OpenClaw instance"
+                echo "❌ Base URL not responding"
             fi
+            
+            # Test health endpoint
+            if curl -f --max-time 10 "http://$ALB_DNS/health" > /dev/null 2>&1; then
+                echo "✅ Health endpoint responding"
+                echo "Health check response:"
+                curl -s --max-time 10 "http://$ALB_DNS/health" | jq '.' 2>/dev/null || curl -s --max-time 10 "http://$ALB_DNS/health"
+            else
+                echo "❌ Health endpoint not responding"
+            fi
+        else
+            echo "⚠️ No Load Balancer found or not accessible"
         fi
-        
-        # Performance test
-        print_status "Running performance test..."
-        local response_time=$(curl -o /dev/null -s -w '%{time_total}' "http://$lb_dns/health" 2>/dev/null || echo "0")
-        echo "Response time: ${response_time}s"
-        log "Response time: ${response_time}s"
-        
-        # Check if continuous monitoring
-        if [ "$continuous" != "true" ]; then
-            break
-        fi
-        
-        echo ""
-        print_status "Next check in ${CHECK_INTERVAL} seconds... (Ctrl+C to stop)"
-        sleep "$CHECK_INTERVAL"
-    done
+    else
+        echo "⚠️ Cannot check application health - AWS CLI not configured"
+    fi
+    
+    echo ""
 }
 
-print_help() {
-    echo "OpenClaw EC2 Deployment Monitor"
+# Function to check CloudWatch logs
+check_cloudwatch_logs() {
+    echo "📝 CloudWatch Logs:"
+    echo "------------------"
+    
+    if command -v aws &> /dev/null && aws sts get-caller-identity &> /dev/null; then
+        # Check for OpenClaw log groups
+        LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/aws/ec2/openclaw" --query 'logGroups[].logGroupName' --output text 2>/dev/null || echo "")
+        
+        if [ -n "$LOG_GROUPS" ]; then
+            echo "📋 Found log groups:"
+            for LOG_GROUP in $LOG_GROUPS; do
+                echo "   - $LOG_GROUP"
+                
+                # Get recent log events
+                echo "   Recent entries (last 5):"
+                aws logs describe-log-streams --log-group-name "$LOG_GROUP" --order-by LastEventTime --descending --max-items 1 --query 'logStreams[0].logStreamName' --output text | xargs -I {} aws logs get-log-events --log-group-name "$LOG_GROUP" --log-stream-name {} --limit 5 --query 'events[*].[timestamp,message]' --output text 2>/dev/null | tail -5 | while read -r timestamp message; do
+                    DATE=$(date -d "@$((timestamp/1000))" 2>/dev/null || date -r $((timestamp/1000)) 2>/dev/null || echo "Unknown")
+                    echo "     [$DATE] $message"
+                done 2>/dev/null || echo "     No recent log entries available"
+            done
+        else
+            echo "⚠️ No CloudWatch log groups found"
+        fi
+    else
+        echo "⚠️ Cannot check CloudWatch logs - AWS CLI not configured"
+    fi
+    
     echo ""
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  -c, --continuous    Run continuous monitoring"
-    echo "  -d, --domain DOMAIN Custom domain for SSL checks"
-    echo "  -l, --lb-dns DNS    Load balancer DNS name"
-    echo "  -i, --interval SEC  Check interval for continuous mode (default: 30)"
-    echo "  -h, --help          Show this help message"
-    echo ""
-    echo "Examples:"
-    echo "  $0                                    # One-time health check"
-    echo "  $0 -c                                # Continuous monitoring"
-    echo "  $0 -d openclaw.example.com           # Include SSL checks"
-    echo "  $0 -l my-lb-123456.us-east-1.elb.amazonaws.com"
 }
 
-# Parse command line arguments
-CONTINUOUS=false
-DOMAIN=""
-LB_DNS=""
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -c|--continuous)
-            CONTINUOUS=true
-            shift
-            ;;
-        -d|--domain)
-            DOMAIN="$2"
-            shift 2
-            ;;
-        -l|--lb-dns)
-            LB_DNS="$2"
-            shift 2
-            ;;
-        -i|--interval)
-            CHECK_INTERVAL="$2"
-            shift 2
-            ;;
-        -h|--help)
-            print_help
-            exit 0
-            ;;
-        *)
-            print_error "Unknown option: $1"
-            print_help
-            exit 1
-            ;;
-    esac
-done
+# Function to show next steps
+show_next_steps() {
+    echo "🎯 Next Steps:"
+    echo "-------------"
+    echo ""
+    echo "1. 📊 Monitor GitHub Actions:"
+    echo "   https://github.com/$REPO_NAME/actions"
+    echo ""
+    echo "2. 🔍 If deployment successful, verify application:"
+    echo "   - Check Load Balancer URL for OpenClaw Gateway"
+    echo "   - Test /health endpoint"
+    echo "   - Verify all security groups are properly configured"
+    echo ""
+    echo "3. 🔧 If deployment failed:"
+    echo "   - Check GitHub Actions logs for specific errors"
+    echo "   - Verify AWS credentials and permissions"
+    echo "   - Check Terraform state and backend configuration"
+    echo ""
+    echo "4. 🛡️ Security Review:"
+    echo "   - Review security group rules (currently open to 0.0.0.0/0)"
+    echo "   - Consider restricting access to specific IP ranges"
+    echo "   - Set up monitoring alerts"
+    echo ""
+    echo "5. 📈 Performance Optimization:"
+    echo "   - Monitor CloudWatch metrics"
+    echo "   - Adjust Auto Scaling Group parameters if needed"
+    echo "   - Review instance types and sizes"
+    echo ""
+}
 
 # Main execution
 main() {
-    # Get load balancer DNS if not provided
-    if [ -z "$LB_DNS" ]; then
-        LB_DNS=$(get_load_balancer_dns)
-    fi
+    check_github_actions
+    check_aws_infrastructure
+    check_application_health
+    check_cloudwatch_logs
+    show_next_steps
     
-    if [ -z "$LB_DNS" ]; then
-        print_error "Load balancer DNS is required"
-        exit 1
-    fi
-    
-    # Start monitoring
-    monitor_deployment "$LB_DNS" "$DOMAIN" "$CONTINUOUS"
-    
+    echo "🏁 Monitoring complete!"
     echo ""
-    print_success "Monitoring complete. Check $LOG_FILE for detailed logs."
+    echo "💡 Tip: Run this script periodically to track deployment progress"
+    echo "   or set up AWS CloudWatch alarms for automated monitoring."
 }
 
-# Run main function
-main
+# Execute main function
+main "$@"
