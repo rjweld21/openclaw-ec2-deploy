@@ -113,7 +113,8 @@ data "aws_ec2_instance_type_offerings" "available" {
 # Check current resource counts to avoid limits
 data "aws_vpcs" "all" {}
 
-data "aws_internet_gateways" "all" {}
+# Internet gateway discovery - using VPC-attached gateway instead
+# data "aws_internet_gateways" "all" {}
 
 # Output validation results for debugging
 output "validation_results" {

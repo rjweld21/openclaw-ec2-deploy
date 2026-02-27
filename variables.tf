@@ -101,6 +101,25 @@ variable "openclaw_port" {
   default     = 3000
 }
 
+# Infrastructure Configuration
+variable "ami_id" {
+  description = "Custom AMI ID (leave empty to use latest Amazon Linux 2)"
+  type        = string
+  default     = ""
+}
+
+variable "availability_zones" {
+  description = "List of availability zones (leave empty to use first 3 available)"
+  type        = list(string)
+  default     = []
+}
+
+variable "backup_retention_days" {
+  description = "Number of days to retain EBS snapshots (0 to disable)"
+  type        = number
+  default     = 7
+}
+
 # OpenClaw Configuration
 variable "anthropic_api_key" {
   description = "Anthropic API key for OpenClaw Claude integration"
