@@ -180,14 +180,9 @@ resource "aws_cloudfront_distribution" "frontend" {
 
   viewer_certificate {
     cloudfront_default_certificate = var.ssl_certificate_arn == ""
-    
-    dynamic "acm_certificate_arn" {
-      for_each = var.ssl_certificate_arn != "" ? [1] : []
-      content {
-        acm_certificate_arn = var.ssl_certificate_arn
-        ssl_support_method  = "sni-only"
-      }
-    }
+    acm_certificate_arn           = var.ssl_certificate_arn != "" ? var.ssl_certificate_arn : null
+    ssl_support_method            = var.ssl_certificate_arn != "" ? "sni-only" : null
+    minimum_protocol_version      = var.ssl_certificate_arn != "" ? "TLSv1.2_2021" : null
   }
 
   # Custom error responses for React SPA
@@ -225,6 +220,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "frontend_artifacts" {
   rule {
     id     = "artifact_cleanup"
     status = "Enabled"
+
+    filter {
+      prefix = ""  # Apply to all objects
+    }
 
     expiration {
       days = 7
