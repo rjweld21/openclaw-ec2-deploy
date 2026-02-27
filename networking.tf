@@ -172,20 +172,11 @@ resource "aws_security_group" "alb" {
 
   # Outbound traffic to application instances
   egress {
-    description     = "To application instances"
-    from_port       = var.openclaw_port
-    to_port         = var.openclaw_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.app.id]
-  }
-
-  # Health check traffic
-  egress {
-    description     = "Health checks"
-    from_port       = var.openclaw_port
-    to_port         = var.openclaw_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.app.id]
+    description = "To application instances"
+    from_port   = var.openclaw_port
+    to_port     = var.openclaw_port
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.main.cidr_block]  # Use CIDR instead of security group reference
   }
 
   tags = merge(local.common_tags, {
@@ -204,14 +195,13 @@ resource "aws_security_group" "app" {
   description = "Security group for OpenClaw application instances"
   vpc_id      = aws_vpc.main.id
 
-  # Application port from load balancer
+  # Application port from load balancer or direct access
   ingress {
-    description     = "Application traffic from ALB"
-    from_port       = var.openclaw_port
-    to_port         = var.openclaw_port
-    protocol        = "tcp"
-    security_groups = var.enable_load_balancer ? [aws_security_group.alb[0].id] : []
-    cidr_blocks     = var.enable_load_balancer ? [] : var.allowed_cidr_blocks
+    description = "Application traffic"
+    from_port   = var.openclaw_port
+    to_port     = var.openclaw_port
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
   }
 
   # SSH access (if key pair is specified)
