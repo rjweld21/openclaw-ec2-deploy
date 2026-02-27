@@ -136,9 +136,7 @@ output "validation_results" {
 check "ami_availability" {
   assert {
     condition = var.ami_id != "" ? length(data.aws_ami.specified) > 0 : length(data.aws_ami.amazon_linux) > 0
-    error_message = var.ami_id != "" ? 
-      "Specified AMI ${var.ami_id} is not available in region ${data.aws_region.current.name}" :
-      "No suitable Amazon Linux 2 AMI found in region ${data.aws_region.current.name}"
+    error_message = var.ami_id != "" ? "Specified AMI ${var.ami_id} is not available in region ${data.aws_region.current.name}" : "No suitable Amazon Linux 2 AMI found in region ${data.aws_region.current.name}"
   }
 }
 

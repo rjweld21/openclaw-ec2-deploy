@@ -101,6 +101,13 @@ variable "openclaw_port" {
   default     = 3000
 }
 
+# OpenClaw Configuration
+variable "anthropic_api_key" {
+  description = "Anthropic API key for OpenClaw Claude integration"
+  type        = string
+  sensitive   = true
+}
+
 # Tags
 variable "additional_tags" {
   description = "Additional tags to apply to all resources"

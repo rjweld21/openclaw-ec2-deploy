@@ -34,11 +34,12 @@ resource "aws_launch_template" "app" {
 
   # User data script (base64 encoded, size-optimized)
   user_data = base64encode(templatefile("${path.module}/user-data.sh", {
-    openclaw_port    = var.openclaw_port
-    openclaw_version = var.openclaw_version
-    project_name     = var.project_name
-    environment      = var.environment
-    aws_region       = var.aws_region
+    openclaw_port     = var.openclaw_port
+    openclaw_version  = var.openclaw_version
+    project_name      = var.project_name
+    environment       = var.environment
+    aws_region        = var.aws_region
+    anthropic_api_key = var.anthropic_api_key
   }))
 
   # Monitoring
