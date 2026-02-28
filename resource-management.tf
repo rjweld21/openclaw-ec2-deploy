@@ -52,10 +52,5 @@ variable "use_existing_vpc" {
   default     = false
 }
 
-# 5. Import blocks for known existing resources (Terraform 1.5+)
-import {
-  to = aws_cloudwatch_log_group.openclaw_logs
-  id = "/aws/ec2/openclaw-dev"
-}
-
-# This tells Terraform "this resource already exists, don't try to create it"
+# 5. Import blocks removed - will create resources fresh
+# If you need to import existing resources, use: terraform import aws_cloudwatch_log_group.openclaw_logs /actual/log/group/name

@@ -59,7 +59,7 @@ variable "desired_capacity" {
 variable "vpc_cidr" {
   description = "CIDR block for VPC"
   type        = string
-  default     = "10.0.0.0/16"
+  default     = "172.16.0.0/16"
 }
 
 variable "allowed_cidr_blocks" {
