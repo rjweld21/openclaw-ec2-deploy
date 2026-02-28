@@ -33,6 +33,7 @@ on:
         - plan
         - apply
         - destroy
+        - fix-drift
 
 # 🔧 FIX: Add concurrency control to prevent parallel builds
 concurrency:
@@ -538,3 +539,179 @@ jobs:
 
       - name: Terraform Destroy
         run: terraform destroy -auto-approve
+
+  fix-drift:
+    name: Fix Terraform State Drift
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'fix-drift'
+    environment: 
+      name: ${{ github.event.inputs.environment }}
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-fix-drift-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (Access Keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region = "${{ env.AWS_DEFAULT_REGION }}"
+          environment = "${{ env.TF_VAR_environment }}"
+          project_name = "openclaw"
+          instance_type = "${{ vars.INSTANCE_TYPE || 't3.medium' }}"
+          EOF
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'openclaw-terraform-state' }}" \
+            -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+
+      - name: Analyze Current State
+        id: analyze
+        run: |
+          echo "🔍 Analyzing Terraform state vs AWS reality..."
+          
+          # Check if state file exists and has resources
+          terraform state list > current_state.txt 2>/dev/null || echo "No state found" > current_state.txt
+          
+          echo "📝 Current Terraform State:"
+          cat current_state.txt
+          
+          # Check what AWS resources actually exist
+          echo "🌐 Checking AWS resources..."
+          
+          # Look for VPCs with our naming pattern
+          aws ec2 describe-vpcs --filters "Name=tag:Name,Values=openclaw-*" --query 'Vpcs[*].[VpcId,Tags[?Key==`Name`].Value|[0]]' --output table || true
+          
+          # Look for EC2 instances
+          aws ec2 describe-instances --filters "Name=tag:Name,Values=openclaw-*" --query 'Reservations[*].Instances[*].[InstanceId,State.Name,Tags[?Key==`Name`].Value|[0]]' --output table || true
+          
+          # Look for CloudWatch log groups
+          aws logs describe-log-groups --log-group-name-prefix "/aws/ec2/openclaw" --query 'logGroups[*].[logGroupName,creationTime]' --output table || true
+
+      - name: Terraform Refresh State
+        id: refresh
+        run: |
+          echo "🔄 Refreshing Terraform state to sync with AWS..."
+          set +e  # Don't exit on error to capture exit code
+          
+          terraform refresh
+          REFRESH_EXIT_CODE=$?
+          
+          echo "refresh_exit_code=$REFRESH_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $REFRESH_EXIT_CODE -ne 0 ]; then
+            echo "⚠️ Terraform refresh had issues (exit code: $REFRESH_EXIT_CODE)"
+            echo "This might indicate state drift that needs manual resolution"
+          else
+            echo "✅ Terraform refresh completed successfully"
+          fi
+
+      - name: Check Plan After Refresh
+        id: plan_check
+        run: |
+          echo "📋 Checking what Terraform wants to do after refresh..."
+          set +e
+          
+          terraform plan -detailed-exitcode -out=drift-check-plan
+          PLAN_EXIT_CODE=$?
+          
+          echo "plan_exit_code=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Save plan output for analysis
+          terraform show -no-color drift-check-plan > plan-analysis.txt
+          
+          echo "📊 Plan Analysis:"
+          if [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "✅ No changes needed - state is in sync!"
+            echo "status=success" >> $GITHUB_OUTPUT
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "📋 Changes detected after refresh:"
+            head -50 plan-analysis.txt
+            echo "status=changes_detected" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Plan failed after refresh (exit code: $PLAN_EXIT_CODE)"
+            echo "This likely indicates resources that exist in AWS but not in Terraform state"
+            cat plan-analysis.txt
+            echo "status=plan_failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Attempt Resource Import (if needed)
+        if: steps.plan_check.outputs.status == 'plan_failed'
+        id: import
+        run: |
+          echo "🔧 Attempting to import existing resources..."
+          
+          # This is a simplified import attempt - in a real scenario, you'd need to identify
+          # specific resources from the plan failure and import them individually
+          
+          # Example: Try to import common conflicting resources
+          # Note: You'll need to adjust these based on your actual resource names and IDs
+          
+          echo "⚠️ Resource import requires manual identification of existing resource IDs"
+          echo "💡 Common import patterns:"
+          echo "  terraform import aws_vpc.main vpc-xxxxxxxx"
+          echo "  terraform import aws_cloudwatch_log_group.logs /aws/ec2/openclaw-dev"
+          echo "  terraform import aws_security_group.main sg-xxxxxxxx"
+          
+          # For automated import, you'd need to:
+          # 1. Parse the plan output to identify conflicting resources
+          # 2. Query AWS to get the actual resource IDs  
+          # 3. Run terraform import commands
+          
+          echo "status=manual_intervention_needed" >> $GITHUB_OUTPUT
+
+      - name: Final Status Assessment
+        run: |
+          REFRESH_STATUS="${{ steps.refresh.outputs.refresh_exit_code }}"
+          PLAN_STATUS="${{ steps.plan_check.outputs.status }}"
+          IMPORT_STATUS="${{ steps.import.outputs.status }}"
+          
+          echo "## 🔍 State Drift Analysis Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status | Code |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform Refresh | $([ "$REFRESH_STATUS" = "0" ] && echo "✅ Success" || echo "❌ Failed") | $REFRESH_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plan After Refresh | $PLAN_STATUS | ${{ steps.plan_check.outputs.plan_exit_code }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Import Attempt | ${IMPORT_STATUS:-"Not needed"} | - |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$PLAN_STATUS" = "success" ]; then
+            echo "## ✅ SUCCESS: State is now synchronized!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Step:** Run deployment with action: 'apply'" >> $GITHUB_STEP_SUMMARY
+          elif [ "$PLAN_STATUS" = "changes_detected" ]; then
+            echo "## ⚠️ PARTIAL SUCCESS: State refreshed but changes detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Step:** Review planned changes and run action: 'apply' if acceptable" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ DRIFT FIX FAILED: Manual intervention or nuclear option needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Step:** Run action: 'destroy' followed by 'apply' for clean slate" >> $GITHUB_STEP_SUMMARY
+          fi
