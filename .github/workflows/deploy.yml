@@ -102,23 +102,11 @@ jobs:
       - name: Pre-warm Plugin Cache
         run: |
           echo "🚀 Pre-downloading AWS provider to prevent timeout issues..."
-          # Create a minimal temporary configuration to download providers
-          cat > temp-providers.tf << 'EOF'
-          terraform {
-            required_version = ">= 1.6.0"
-            required_providers {
-              aws = {
-                source  = "hashicorp/aws"
-                version = "~> 5.31.0"
-              }
-            }
-          }
-          EOF
+          echo "ℹ️ Using existing versions.tf configuration for plugin download..."
           
-          # Initialize to download providers to cache
+          # Initialize with existing configuration to pre-download providers to cache
           terraform init -backend=false
-          rm -f temp-providers.tf
-          echo "✅ AWS provider pre-downloaded to plugin cache"
+          echo "✅ AWS provider pre-downloaded to plugin cache using existing configuration"
         env:
           TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
           TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
