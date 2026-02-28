@@ -1,0 +1,56 @@
+# Enhanced deployment steps for idempotent deployments
+# Add these steps to your existing deploy.yml workflow
+
+- name: Handle State Drift Automatically  
+  run: |
+    echo "🔍 Checking for state drift..."
+    
+    # Refresh state to sync with AWS reality
+    terraform refresh
+    
+    # Check if there are any issues
+    terraform plan -detailed-exitcode -out=drift-plan
+    PLAN_EXIT_CODE=$?
+    
+    if [ $PLAN_EXIT_CODE -eq 1 ]; then
+      echo "❌ Terraform plan failed - likely state drift issues"
+      echo "🔧 Attempting automatic drift resolution..."
+      
+      # Common drift resolution strategies:
+      # 1. Try importing common conflicting resources
+      # 2. Remove and recreate problematic resources
+      
+      # Log what needs to be fixed
+      terraform show drift-plan
+      
+      # For now, fail and require manual intervention
+      echo "💡 Please run 'fix-state-drift' workflow to resolve"
+      exit 1
+    elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+      echo "📋 Changes detected - proceeding with apply"
+    else
+      echo "✅ No changes needed - infrastructure is in desired state"
+    fi
+
+- name: Apply with Retry Logic
+  run: |
+    MAX_RETRIES=3
+    RETRY=1
+    
+    while [ $RETRY -le $MAX_RETRIES ]; do
+      echo "🚀 Apply attempt $RETRY/$MAX_RETRIES"
+      
+      if terraform apply -auto-approve; then
+        echo "✅ Apply successful!"
+        break
+      else
+        if [ $RETRY -eq $MAX_RETRIES ]; then
+          echo "❌ Apply failed after $MAX_RETRIES attempts"
+          exit 1
+        fi
+        
+        echo "⚠️ Apply failed, waiting 30s before retry..."
+        sleep 30
+        RETRY=$((RETRY + 1))
+      fi
+    done

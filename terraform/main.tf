@@ -139,9 +139,17 @@ resource "aws_security_group" "openclaw_ec2" {
   }
 
   ingress {
-    description = "Custom port 8080"
+    description = "OpenClaw Gateway"
     from_port   = 8080
     to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Health Check"
+    from_port   = 8081
+    to_port     = 8081
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -181,7 +189,7 @@ resource "aws_instance" "openclaw" {
   vpc_security_group_ids = [aws_security_group.openclaw_ec2.id]
   subnet_id              = aws_subnet.public.id
 
-  user_data = base64encode(templatefile("${path.module}/user_data.sh", {
+  user_data = base64encode(templatefile("${path.module}/user_data_enhanced.sh", {
     ssh_public_key = tls_private_key.openclaw.public_key_openssh
   }))
 
@@ -231,4 +239,29 @@ output "vpc_id" {
 output "security_group_id" {
   description = "ID of the security group"
   value       = aws_security_group.openclaw_ec2.id
+}
+
+output "openclaw_gateway_url" {
+  description = "URL for OpenClaw Gateway"
+  value       = "http://${aws_instance.openclaw.public_ip}:8080"
+}
+
+output "health_check_url" {
+  description = "URL for health check endpoint"
+  value       = "http://${aws_instance.openclaw.public_ip}:8081"
+}
+
+output "openclaw_validation_command" {
+  description = "Command to validate OpenClaw installation on the instance"
+  value       = "ssh -i ${var.key_pair_name}.pem ubuntu@${aws_instance.openclaw.public_ip} 'sudo -u openclaw /opt/openclaw/validate-installation.sh'"
+}
+
+output "openclaw_logs_command" {
+  description = "Command to view OpenClaw logs"
+  value       = "ssh -i ${var.key_pair_name}.pem ubuntu@${aws_instance.openclaw.public_ip} 'sudo -u openclaw pm2 logs'"
+}
+
+output "openclaw_pm2_status_command" {
+  description = "Command to check PM2 process status"
+  value       = "ssh -i ${var.key_pair_name}.pem ubuntu@${aws_instance.openclaw.public_ip} 'sudo -u openclaw pm2 status'"
 }
