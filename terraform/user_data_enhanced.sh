@@ -118,6 +118,9 @@ cat > ~/.openclaw/config.json << 'CONFIG_EOF'
       \"origin\": \"*\"
     }
   },
+  \"anthropic\": {
+    \"api_key\": \"${anthropic_api_key}\"
+  },
   \"logging\": {
     \"level\": \"info\",
     \"file\": \"/opt/openclaw/logs/openclaw.log\"
@@ -142,6 +145,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         OPENCLAW_CONFIG: '/home/openclaw/.openclaw/config.json',
+        ANTHROPIC_API_KEY: '${anthropic_api_key}',
         PORT: '8080'
       },
       instances: 1,

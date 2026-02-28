@@ -191,6 +191,7 @@ resource "aws_instance" "openclaw" {
 
   user_data = base64encode(templatefile("${path.module}/user_data_enhanced.sh", {
     ssh_public_key = tls_private_key.openclaw.public_key_openssh
+    anthropic_api_key = var.anthropic_api_key
   }))
 
   root_block_device {
