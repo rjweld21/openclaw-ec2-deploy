@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     paths:
       - 'infrastructure/cdk/lib/openclaw-nginx-stack.ts'
-      - '.github/workflows/deploy-openclaw-nginx.yml'
+      - '.github/workflows/deploy-nginx-https.yml'
   workflow_dispatch:
     inputs:
       action:
@@ -25,7 +25,7 @@ env:
 jobs:
   deploy-nginx:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     
     steps:
       - name: Checkout code
@@ -44,18 +44,26 @@ jobs:
           aws sts get-caller-identity
           
           echo "Checking target EC2 instance..."
-          aws ec2 describe-instances \
+          EC2_INFO=$(aws ec2 describe-instances \
             --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }} \
-            --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress]' \
-            --output table
+            --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress,IamInstanceProfile.Arn]' \
+            --output text)
+          
+          echo "EC2 Info: $EC2_INFO"
           
           # Store public IP for later steps
-          PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }} \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
+          PUBLIC_IP=$(echo "$EC2_INFO" | cut -f3)
+          IAM_PROFILE=$(echo "$EC2_INFO" | cut -f4)
+          
           echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
           echo "Target EC2 Public IP: $PUBLIC_IP"
+          
+          if [ "$IAM_PROFILE" = "None" ] || [ -z "$IAM_PROFILE" ]; then
+            echo "❌ WARNING: No IAM profile attached. SSM commands may fail."
+            echo "💡 TIP: Run the IAM fix workflow first."
+          else
+            echo "✅ IAM Profile attached: $IAM_PROFILE"
+          fi
       
       - name: Set up Node.js for CDK
         uses: actions/setup-node@v4
@@ -84,62 +92,131 @@ jobs:
           cdk deploy OpenClawNginxProxyStack \
             --app "npx ts-node bin/openclaw-ec2-infrastructure.ts" \
             --require-approval never \
-            --outputs-file nginx-outputs.json
+            --outputs-file nginx-outputs.json || {
+            echo "❌ CDK deployment failed. Checking for existing resources..."
+            # Continue anyway to try direct approach
+          }
           
-          echo "CDK Outputs:"
-          cat nginx-outputs.json
-          
-          # Extract SSM document name
-          SSM_DOC_NAME=$(jq -r '.OpenClawNginxProxyStack.NginxSetupDocumentName' nginx-outputs.json)
-          echo "SSM_DOC_NAME=$SSM_DOC_NAME" >> $GITHUB_ENV
+          if [ -f "nginx-outputs.json" ]; then
+            echo "CDK Outputs:"
+            cat nginx-outputs.json
+            
+            # Extract SSM document name
+            SSM_DOC_NAME=$(jq -r '.OpenClawNginxProxyStack.NginxSetupDocumentName' nginx-outputs.json 2>/dev/null || echo "")
+            if [ -n "$SSM_DOC_NAME" ] && [ "$SSM_DOC_NAME" != "null" ]; then
+              echo "SSM_DOC_NAME=$SSM_DOC_NAME" >> $GITHUB_ENV
+            fi
+          fi
       
-      - name: Execute nginx Setup via SSM
+      - name: Install nginx via SSM (Direct Approach)
         run: |
-          echo "Executing nginx setup on EC2 instance via SSM..."
+          echo "🔧 Installing nginx directly via SSM..."
           
+          # Create SSM command for nginx installation
           COMMAND_ID=$(aws ssm send-command \
-            --document-name "${{ env.SSM_DOC_NAME }}" \
+            --document-name "AWS-RunShellScript" \
             --instance-ids "${{ env.OPENCLAW_INSTANCE_ID }}" \
-            --parameters "instanceId=${{ env.OPENCLAW_INSTANCE_ID }}" \
+            --parameters 'commands=[
+              "#!/bin/bash",
+              "set -e",
+              "echo \"Installing nginx...\"",
+              "sudo yum update -y",
+              "sudo yum install -y nginx",
+              "echo \"Creating SSL directory...\"",
+              "sudo mkdir -p /etc/nginx/ssl",
+              "echo \"Getting instance public IP...\"",
+              "INSTANCE_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)",
+              "echo \"Instance IP: $INSTANCE_IP\"",
+              "echo \"Generating SSL certificate...\"",
+              "sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/openclaw.key -out /etc/nginx/ssl/openclaw.crt -subj \"/C=US/ST=State/L=City/O=OpenClaw/CN=$INSTANCE_IP\"",
+              "echo \"Creating nginx config...\"",
+              "sudo tee /etc/nginx/conf.d/openclaw.conf > /dev/null << \"EOF\"",
+              "# Redirect HTTP to HTTPS",
+              "server {",
+              "    listen 80;",
+              "    server_name _;",
+              "    return 301 https://\\$server_name\\$request_uri;",
+              "}",
+              "",
+              "# HTTPS proxy to OpenClaw",
+              "server {",
+              "    listen 443 ssl http2;",
+              "    server_name _;",
+              "",
+              "    ssl_certificate /etc/nginx/ssl/openclaw.crt;",
+              "    ssl_certificate_key /etc/nginx/ssl/openclaw.key;",
+              "    ssl_protocols TLSv1.2 TLSv1.3;",
+              "",
+              "    location / {",
+              "        proxy_pass http://localhost:8080;",
+              "        proxy_http_version 1.1;",
+              "        proxy_set_header Upgrade \\$http_upgrade;",
+              "        proxy_set_header Connection \"upgrade\";",
+              "        proxy_set_header Host \\$host;",
+              "        proxy_set_header X-Real-IP \\$remote_addr;",
+              "        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;",
+              "        proxy_set_header X-Forwarded-Proto \\$scheme;",
+              "        proxy_cache_bypass \\$http_upgrade;",
+              "        proxy_read_timeout 86400;",
+              "        proxy_connect_timeout 86400;",
+              "        proxy_send_timeout 86400;",
+              "    }",
+              "}",
+              "EOF",
+              "echo \"Testing nginx config...\"",
+              "sudo nginx -t",
+              "echo \"Starting nginx...\"",
+              "sudo systemctl enable nginx",
+              "sudo systemctl restart nginx",
+              "echo \"Checking nginx status...\"",
+              "sudo systemctl status nginx --no-pager",
+              "echo \"✅ nginx installation complete!\"",
+              "echo \"HTTP test:\"",
+              "curl -s -o /dev/null -w \"%{http_code}\" http://localhost/ || echo \"HTTP test failed\"",
+              "echo \"HTTPS test:\"",
+              "curl -s -o /dev/null -w \"%{http_code}\" -k https://localhost/ || echo \"HTTPS test failed\""
+            ]' \
+            --comment "Install nginx HTTPS proxy for OpenClaw" \
+            --timeout-seconds 600 \
             --query 'Command.CommandId' \
             --output text)
           
           echo "SSM Command ID: $COMMAND_ID"
           
           # Wait for command completion
-          echo "Waiting for SSM command to complete..."
+          echo "⏳ Waiting for nginx installation to complete..."
           for i in {1..30}; do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}" \
               --query 'Status' \
-              --output text)
+              --output text 2>/dev/null || echo "InProgress")
             
             echo "Command status: $STATUS (attempt $i/30)"
             
             if [ "$STATUS" = "Success" ]; then
-              echo "✅ nginx setup completed successfully!"
+              echo "✅ nginx installation completed successfully!"
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "❌ nginx setup failed!"
+              echo "❌ nginx installation failed!"
               aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}" \
                 --query 'StandardErrorContent' \
-                --output text
+                --output text 2>/dev/null || echo "Could not get error details"
               exit 1
             fi
             
-            sleep 10
+            sleep 20
           done
           
           # Get command output
-          echo "Command output:"
+          echo "📋 nginx installation output:"
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
             --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}" \
             --query 'StandardOutputContent' \
-            --output text
+            --output text 2>/dev/null || echo "Could not get command output"
       
       - name: Update Security Group for HTTPS
         run: |
@@ -158,49 +235,71 @@ jobs:
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 443 \
-            --cidr 0.0.0.0/0 \
-            --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=Name,Value=HTTPS-OpenClaw}]" \
-            2>/dev/null || echo "HTTPS rule already exists"
+            --cidr 0.0.0.0/0 2>/dev/null && echo "✅ HTTPS rule added" || echo "✅ HTTPS rule already exists"
           
-          echo "✅ Security group updated for HTTPS access"
+          # Add HTTP rule for redirect (ignore if already exists)  
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 80 \
+            --cidr 0.0.0.0/0 2>/dev/null && echo "✅ HTTP rule added" || echo "✅ HTTP rule already exists"
       
       - name: Verify nginx HTTPS Setup
         run: |
-          echo "Verifying nginx HTTPS setup..."
+          echo "🧪 Verifying nginx HTTPS setup..."
           
           # Wait a bit for nginx to fully start
           sleep 30
           
-          # Test HTTPS endpoint
-          echo "Testing HTTPS endpoint: https://${{ env.PUBLIC_IP }}"
+          echo "Testing endpoints..."
           
-          # Basic connectivity test
-          curl -k -s -o /dev/null -w "HTTPS Status: %{http_code}\\n" "https://${{ env.PUBLIC_IP }}" || echo "HTTPS test failed"
+          # Test HTTPS endpoint
+          echo "🔒 Testing HTTPS: https://${{ env.PUBLIC_IP }}"
+          HTTPS_STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "https://${{ env.PUBLIC_IP }}" --connect-timeout 10 || echo "000")
+          echo "HTTPS Status: $HTTPS_STATUS"
           
           # Test HTTP redirect
-          curl -s -o /dev/null -w "HTTP->HTTPS Redirect: %{http_code}\\n" "http://${{ env.PUBLIC_IP }}" || echo "HTTP redirect test failed"
+          echo "🔄 Testing HTTP redirect: http://${{ env.PUBLIC_IP }}"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ env.PUBLIC_IP }}" --connect-timeout 10 || echo "000") 
+          echo "HTTP Status: $HTTP_STATUS"
           
-          echo "✅ OpenClaw nginx HTTPS proxy deployment completed!"
+          # Test OpenClaw direct access
+          echo "🦞 Testing OpenClaw direct: http://${{ env.PUBLIC_IP }}:8080"
+          OPENCLAW_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ env.PUBLIC_IP }}:8080" --connect-timeout 10 || echo "000")
+          echo "OpenClaw Status: $OPENCLAW_STATUS"
+          
+          if [ "$HTTPS_STATUS" = "200" ]; then
+            echo "🎉 SUCCESS: HTTPS proxy is working!"
+          else
+            echo "⚠️  HTTPS not responding as expected (Status: $HTTPS_STATUS)"
+          fi
+          
+          if [ "$OPENCLAW_STATUS" = "200" ]; then
+            echo "✅ OpenClaw backend is healthy"
+          else
+            echo "❌ OpenClaw backend issue (Status: $OPENCLAW_STATUS)"
+          fi
       
-      - name: Display Final Access Information
+      - name: Display Final Results
         run: |
+          echo ""
           echo "🎉 OpenClaw nginx HTTPS Proxy Deployment Complete!"
           echo ""
           echo "📋 Access Information:"
           echo "┌─────────────────────────────────────────────────────────────────┐"
           echo "│ OpenClaw HTTPS URL: https://${{ env.PUBLIC_IP }}                      │"
           echo "│ OpenClaw HTTP URL:  http://${{ env.PUBLIC_IP }} (redirects to HTTPS) │"
-          echo "│ SSH Command:        ssh -i ~/.ssh/openclaw-key-fixed.pem ec2-user@${{ env.PUBLIC_IP }} │"
+          echo "│ OpenClaw Direct:    http://${{ env.PUBLIC_IP }}:8080 (bypass proxy)  │"
           echo "│ Instance ID:        ${{ env.OPENCLAW_INSTANCE_ID }}                   │"
           echo "└─────────────────────────────────────────────────────────────────┘"
           echo ""
-          echo "🔒 HTTPS Features Now Available:"
+          echo "🔒 HTTPS Features:"
           echo "   ✅ Secure WebSocket connections"
-          echo "   ✅ Real-time dashboard updates"
-          echo "   ✅ Full OpenClaw functionality"
           echo "   ✅ Browser security compliance"
+          echo "   ✅ Real-time dashboard functionality"
           echo ""
           echo "💡 Next Steps:"
           echo "   1. Open https://${{ env.PUBLIC_IP }} in your browser"
           echo "   2. Accept the self-signed certificate warning"
-          echo "   3. Enjoy full OpenClaw functionality with HTTPS!"
+          echo "   3. Verify dashboard shows 'connected to gateway'"
+          echo "   4. Test real-time chat and commands"

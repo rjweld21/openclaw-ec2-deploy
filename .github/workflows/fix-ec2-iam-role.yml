@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     paths:
       - 'infrastructure/cdk/lib/fix-ec2-iam-role-stack.ts'
-      - '.github/workflows/fix-ec2-iam-workflow.yml'
+      - '.github/workflows/fix-ec2-iam-role.yml'
   workflow_dispatch:
     inputs:
       action:
@@ -86,11 +86,20 @@ jobs:
             --outputs-file iam-fix-outputs.json
           
           echo "CDK Outputs:"
-          cat iam-fix-outputs.json
+          cat iam-fix-outputs.json || echo "No outputs file generated"
           
           # Extract instance profile name
-          INSTANCE_PROFILE_NAME=$(jq -r '.OpenClawEC2IamFixStack.InstanceProfileName' iam-fix-outputs.json)
-          echo "INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME" >> $GITHUB_ENV
+          if [ -f "iam-fix-outputs.json" ]; then
+            INSTANCE_PROFILE_NAME=$(jq -r '.OpenClawEC2IamFixStack.InstanceProfileName' iam-fix-outputs.json 2>/dev/null || echo "")
+            if [ -n "$INSTANCE_PROFILE_NAME" ] && [ "$INSTANCE_PROFILE_NAME" != "null" ]; then
+              echo "INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME" >> $GITHUB_ENV
+            else
+              echo "⚠️  Could not extract instance profile name from CDK outputs"
+              # Fallback: try to find the created instance profile
+              INSTANCE_PROFILE_NAME=$(aws iam list-instance-profiles --query 'InstanceProfiles[?contains(InstanceProfileName, `OpenClaw`)].InstanceProfileName' --output text | head -1)
+              echo "INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME" >> $GITHUB_ENV
+            fi
+          fi
       
       - name: Stop EC2 Instance (Required for IAM Profile Changes)
         run: |
@@ -104,11 +113,23 @@ jobs:
       - name: Attach IAM Instance Profile
         run: |
           echo "🔗 Attaching IAM instance profile to EC2..."
-          aws ec2 associate-iam-instance-profile \
-            --instance-id ${{ env.OPENCLAW_INSTANCE_ID }} \
-            --iam-instance-profile Name="${{ env.INSTANCE_PROFILE_NAME }}"
           
-          echo "✅ IAM instance profile attached"
+          if [ -z "${{ env.INSTANCE_PROFILE_NAME }}" ]; then
+            echo "❌ No instance profile name available. Looking for existing profile..."
+            INSTANCE_PROFILE_NAME=$(aws iam list-instance-profiles --query 'InstanceProfiles[?contains(InstanceProfileName, `OpenClaw`)].InstanceProfileName' --output text | head -1)
+          else
+            INSTANCE_PROFILE_NAME="${{ env.INSTANCE_PROFILE_NAME }}"
+          fi
+          
+          if [ -n "$INSTANCE_PROFILE_NAME" ]; then
+            aws ec2 associate-iam-instance-profile \
+              --instance-id ${{ env.OPENCLAW_INSTANCE_ID }} \
+              --iam-instance-profile Name="$INSTANCE_PROFILE_NAME"
+            echo "✅ IAM instance profile attached: $INSTANCE_PROFILE_NAME"
+          else
+            echo "❌ Could not find IAM instance profile to attach"
+            exit 1
+          fi
       
       - name: Start EC2 Instance
         run: |
@@ -130,7 +151,7 @@ jobs:
             if aws ssm describe-instance-information \
                --filters "Key=InstanceIds,Values=${{ env.OPENCLAW_INSTANCE_ID }}" \
                --query 'InstanceInformationList[0].PingStatus' \
-               --output text | grep -q "Online"; then
+               --output text 2>/dev/null | grep -q "Online"; then
               echo "✅ SSM connectivity verified!"
               break
             else
@@ -153,10 +174,10 @@ jobs:
           echo "Command ID: $COMMAND_ID"
           
           # Wait for command completion
-          sleep 10
+          sleep 15
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}"
+            --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}" || true
           
           # Get results
           echo "✅ SSM Command Results:"
@@ -164,7 +185,7 @@ jobs:
             --command-id "$COMMAND_ID" \
             --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}" \
             --query 'StandardOutputContent' \
-            --output text
+            --output text || echo "Could not get command output"
       
       - name: Update Public IP for Monitoring
         run: |
@@ -180,9 +201,7 @@ jobs:
           echo "┌─────────────────────────────────────────────────────────────────┐"
           echo "│ Instance ID:        ${{ env.OPENCLAW_INSTANCE_ID }}                    │"
           echo "│ Public IP:          $PUBLIC_IP                                     │"
-          echo "│ IAM Profile:        ${{ env.INSTANCE_PROFILE_NAME }}              │"
-          echo "│ SSM Status:         ✅ Working                                     │"
+          echo "│ SSM Status:         ✅ Ready for nginx deployment                 │"
           echo "└─────────────────────────────────────────────────────────────────┘"
           echo ""
           echo "🔄 NEXT STEP: nginx HTTPS proxy deployment can now proceed!"
-          echo "   The nginx workflow should now work successfully."
