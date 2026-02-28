@@ -130,7 +130,7 @@ jobs:
             echo "🎯 Will use OIDC authentication"
             echo "AUTH_METHOD=oidc" >> $GITHUB_ENV
           elif [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
-            echo "✅ AWS_ACCESS_KEY_ID found (length: ${#{{ secrets.AWS_ACCESS_KEY_ID }}})"
+            echo "✅ AWS_ACCESS_KEY_ID found (configured)"
             echo "🔑 Will use Access Keys authentication"  
             echo "AUTH_METHOD=keys" >> $GITHUB_ENV
           else
@@ -349,7 +349,7 @@ jobs:
             echo "🎯 Will use OIDC authentication"
             echo "AUTH_METHOD=oidc" >> $GITHUB_ENV
           elif [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
-            echo "✅ AWS_ACCESS_KEY_ID found (length: ${#{{ secrets.AWS_ACCESS_KEY_ID }}})"
+            echo "✅ AWS_ACCESS_KEY_ID found (configured)"
             echo "🔑 Will use Access Keys authentication"  
             echo "AUTH_METHOD=keys" >> $GITHUB_ENV
           else
@@ -557,7 +557,7 @@ jobs:
             echo "🎯 Will use OIDC authentication"
             echo "AUTH_METHOD=oidc" >> $GITHUB_ENV
           elif [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
-            echo "✅ AWS_ACCESS_KEY_ID found (length: ${#{{ secrets.AWS_ACCESS_KEY_ID }}})"
+            echo "✅ AWS_ACCESS_KEY_ID found (configured)"
             echo "🔑 Will use Access Keys authentication"  
             echo "AUTH_METHOD=keys" >> $GITHUB_ENV
           else
@@ -636,7 +636,7 @@ jobs:
             echo "🎯 Will use OIDC authentication"
             echo "AUTH_METHOD=oidc" >> $GITHUB_ENV
           elif [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
-            echo "✅ AWS_ACCESS_KEY_ID found (length: ${#{{ secrets.AWS_ACCESS_KEY_ID }}})"
+            echo "✅ AWS_ACCESS_KEY_ID found (configured)"
             echo "🔑 Will use Access Keys authentication"  
             echo "AUTH_METHOD=keys" >> $GITHUB_ENV
           else
