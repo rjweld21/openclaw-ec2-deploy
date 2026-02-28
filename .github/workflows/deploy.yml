@@ -54,6 +54,10 @@ env:
   TF_INPUT: "false"
   TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+  # Plugin optimization settings
+  TF_LOG: "WARN"  # Reduce log verbosity
+  TF_DISABLE_CHECKPOINT: "true"  # Disable update checks
+  TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: "true"
 
 jobs:
   validate:
@@ -75,14 +79,55 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false  # Avoid wrapper issues with outputs
+        env:
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
 
       - name: Terraform Format Check
         id: fmt
         run: terraform fmt -check -recursive
         continue-on-error: true
 
+      - name: Configure Terraform Plugin Cache
+        run: |
+          mkdir -p ${{ github.workspace }}/.terraform.d/plugin-cache
+          cat > ${{ github.workspace }}/.terraformrc << 'EOF'
+          plugin_cache_dir = "${{ github.workspace }}/.terraform.d/plugin-cache"
+          disable_checkpoint = true
+          EOF
+          echo "✅ Plugin cache directory created at: ${{ github.workspace }}/.terraform.d/plugin-cache"
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+
+      - name: Pre-warm Plugin Cache
+        run: |
+          echo "🚀 Pre-downloading AWS provider to prevent timeout issues..."
+          # Create a minimal temporary configuration to download providers
+          cat > temp-providers.tf << 'EOF'
+          terraform {
+            required_version = ">= 1.6.0"
+            required_providers {
+              aws = {
+                source  = "hashicorp/aws"
+                version = "~> 5.31.0"
+              }
+            }
+          }
+          EOF
+          
+          # Initialize to download providers to cache
+          terraform init -backend=false
+          rm -f temp-providers.tf
+          echo "✅ AWS provider pre-downloaded to plugin cache"
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+
       - name: Terraform Init (validation only)
         run: terraform init -backend=false
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
       - name: Terraform Validate
         run: terraform validate
@@ -223,6 +268,16 @@ jobs:
           }
           EOF
 
+      - name: Configure Terraform Plugin Cache
+        run: |
+          mkdir -p ${{ github.workspace }}/.terraform.d/plugin-cache
+          cat > ${{ github.workspace }}/.terraformrc << 'EOF'
+          plugin_cache_dir = "${{ github.workspace }}/.terraform.d/plugin-cache"
+          disable_checkpoint = true
+          EOF
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+
       - name: Terraform Init
         run: |
           # Handle backend configuration based on environment
@@ -239,6 +294,9 @@ jobs:
               -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
               -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
           fi
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
       - name: Terraform Plan
         id: plan
@@ -430,6 +488,16 @@ jobs:
           }
           EOF
 
+      - name: Configure Terraform Plugin Cache
+        run: |
+          mkdir -p ${{ github.workspace }}/.terraform.d/plugin-cache
+          cat > ${{ github.workspace }}/.terraformrc << 'EOF'
+          plugin_cache_dir = "${{ github.workspace }}/.terraform.d/plugin-cache"
+          disable_checkpoint = true
+          EOF
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+
       - name: Terraform Init
         run: |
           if [ "${{ env.TF_VAR_environment }}" = "prod" ]; then
@@ -445,6 +513,9 @@ jobs:
               -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
               -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
           fi
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
       - name: Terraform Apply
         id: apply
@@ -608,6 +679,16 @@ jobs:
           project_name = "openclaw"
           EOF
 
+      - name: Configure Terraform Plugin Cache
+        run: |
+          mkdir -p ${{ github.workspace }}/.terraform.d/plugin-cache
+          cat > ${{ github.workspace }}/.terraformrc << 'EOF'
+          plugin_cache_dir = "${{ github.workspace }}/.terraform.d/plugin-cache"
+          disable_checkpoint = true
+          EOF
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+
       - name: Terraform Init
         run: |
           terraform init \
@@ -615,6 +696,9 @@ jobs:
             -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
             -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
       - name: Terraform Destroy
         run: terraform destroy -auto-approve
@@ -688,6 +772,16 @@ jobs:
           instance_type = "${{ vars.INSTANCE_TYPE || 't3.medium' }}"
           EOF
 
+      - name: Configure Terraform Plugin Cache
+        run: |
+          mkdir -p ${{ github.workspace }}/.terraform.d/plugin-cache
+          cat > ${{ github.workspace }}/.terraformrc << 'EOF'
+          plugin_cache_dir = "${{ github.workspace }}/.terraform.d/plugin-cache"
+          disable_checkpoint = true
+          EOF
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+
       - name: Terraform Init
         run: |
           terraform init \
@@ -695,6 +789,9 @@ jobs:
             -backend-config="key=openclaw-ec2/${{ env.TF_VAR_environment }}/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
             -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE || 'openclaw-terraform-locks' }}"
+        env:
+          TF_CLI_CONFIG_FILE: ${{ github.workspace }}/.terraformrc
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
       - name: Analyze Current State
         id: analyze

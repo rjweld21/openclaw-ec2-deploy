@@ -5,9 +5,15 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 5.31.0"  # More specific version for better stability
     }
   }
+  
+  # Enhanced plugin configuration to prevent timeouts
+  provider_meta "aws" {
+    module_name = "openclaw-ec2-deployment"
+  }
+}
   
   # Using local backend for initial deployment
   # backend "s3" {
