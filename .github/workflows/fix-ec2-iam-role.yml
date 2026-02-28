@@ -1,0 +1,188 @@
+name: URGENT FIX - Add IAM Role to OpenClaw EC2
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'infrastructure/cdk/lib/fix-ec2-iam-role-stack.ts'
+      - '.github/workflows/fix-ec2-iam-workflow.yml'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Fix action'
+        required: true
+        default: 'fix-iam'
+        type: choice
+        options:
+          - fix-iam
+          - verify-fix
+
+env:
+  AWS_REGION: us-east-1
+  OPENCLAW_INSTANCE_ID: i-0f7b10ac4566c4ea4
+
+jobs:
+  fix-iam-role:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Verify Issue - Check Current IAM Status
+        run: |
+          echo "🔍 DIAGNOSING: Checking current EC2 IAM status..."
+          
+          CURRENT_PROFILE=$(aws ec2 describe-instances \
+            --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }} \
+            --query 'Reservations[0].Instances[0].IamInstanceProfile' \
+            --output text)
+          
+          echo "Current IAM Instance Profile: $CURRENT_PROFILE"
+          
+          if [ "$CURRENT_PROFILE" = "None" ] || [ -z "$CURRENT_PROFILE" ]; then
+            echo "❌ CONFIRMED: No IAM instance profile attached"
+            echo "🔧 PROCEEDING: Will create and attach IAM role with SSM permissions"
+          else
+            echo "✅ UNEXPECTED: IAM profile exists: $CURRENT_PROFILE"
+            echo "🔍 Checking SSM permissions..."
+          fi
+      
+      - name: Set up Node.js for CDK
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: infrastructure/cdk/package.json
+      
+      - name: Install CDK dependencies
+        working-directory: ./infrastructure/cdk
+        run: npm install
+      
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+      
+      - name: CDK Bootstrap (if needed)
+        working-directory: ./infrastructure/cdk
+        run: |
+          echo "Ensuring CDK bootstrap..."
+          cdk bootstrap --app "npx ts-node bin/openclaw-ec2-infrastructure.ts" || true
+      
+      - name: CDK Deploy IAM Role and Instance Profile
+        working-directory: ./infrastructure/cdk
+        run: |
+          echo "🚀 Creating IAM role and instance profile..."
+          cdk deploy OpenClawEC2IamFixStack \
+            --app "npx ts-node bin/openclaw-ec2-infrastructure.ts" \
+            --require-approval never \
+            --outputs-file iam-fix-outputs.json
+          
+          echo "CDK Outputs:"
+          cat iam-fix-outputs.json
+          
+          # Extract instance profile name
+          INSTANCE_PROFILE_NAME=$(jq -r '.OpenClawEC2IamFixStack.InstanceProfileName' iam-fix-outputs.json)
+          echo "INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME" >> $GITHUB_ENV
+      
+      - name: Stop EC2 Instance (Required for IAM Profile Changes)
+        run: |
+          echo "⏸️  Stopping EC2 instance to attach IAM profile..."
+          aws ec2 stop-instances --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }}
+          
+          echo "⏳ Waiting for instance to stop..."
+          aws ec2 wait instance-stopped --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }}
+          echo "✅ Instance stopped"
+      
+      - name: Attach IAM Instance Profile
+        run: |
+          echo "🔗 Attaching IAM instance profile to EC2..."
+          aws ec2 associate-iam-instance-profile \
+            --instance-id ${{ env.OPENCLAW_INSTANCE_ID }} \
+            --iam-instance-profile Name="${{ env.INSTANCE_PROFILE_NAME }}"
+          
+          echo "✅ IAM instance profile attached"
+      
+      - name: Start EC2 Instance
+        run: |
+          echo "▶️  Starting EC2 instance..."
+          aws ec2 start-instances --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }}
+          
+          echo "⏳ Waiting for instance to start..."
+          aws ec2 wait instance-running --instance-ids ${{ env.OPENCLAW_INSTANCE_ID }}
+          echo "✅ Instance started"
+      
+      - name: Wait for SSM Agent to Initialize
+        run: |
+          echo "⏳ Waiting for SSM agent to initialize with new IAM role..."
+          sleep 60
+          
+          # Test SSM connectivity
+          echo "🧪 Testing SSM connectivity..."
+          for i in {1..10}; do
+            if aws ssm describe-instance-information \
+               --filters "Key=InstanceIds,Values=${{ env.OPENCLAW_INSTANCE_ID }}" \
+               --query 'InstanceInformationList[0].PingStatus' \
+               --output text | grep -q "Online"; then
+              echo "✅ SSM connectivity verified!"
+              break
+            else
+              echo "⏳ SSM not ready yet (attempt $i/10)..."
+              sleep 30
+            fi
+          done
+      
+      - name: Verify Fix - Test SSM Command Execution
+        run: |
+          echo "🧪 Testing SSM command execution..."
+          
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "${{ env.OPENCLAW_INSTANCE_ID }}" \
+            --parameters 'commands=["echo \"SSM test successful: $(date)\"","whoami","ps aux | grep openclaw | wc -l"]' \
+            --query 'Command.CommandId' \
+            --output text)
+          
+          echo "Command ID: $COMMAND_ID"
+          
+          # Wait for command completion
+          sleep 10
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}"
+          
+          # Get results
+          echo "✅ SSM Command Results:"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ env.OPENCLAW_INSTANCE_ID }}" \
+            --query 'StandardOutputContent' \
+            --output text
+      
+      - name: Update Public IP for Monitoring
+        run: |
+          # Get updated public IP after restart
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ env.OPENCLAW_INSTANCE_ID }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          
+          echo "✅ IAM FIX COMPLETE!"
+          echo ""
+          echo "📋 Updated OpenClaw Access Information:"
+          echo "┌─────────────────────────────────────────────────────────────────┐"
+          echo "│ Instance ID:        ${{ env.OPENCLAW_INSTANCE_ID }}                    │"
+          echo "│ Public IP:          $PUBLIC_IP                                     │"
+          echo "│ IAM Profile:        ${{ env.INSTANCE_PROFILE_NAME }}              │"
+          echo "│ SSM Status:         ✅ Working                                     │"
+          echo "└─────────────────────────────────────────────────────────────────┘"
+          echo ""
+          echo "🔄 NEXT STEP: nginx HTTPS proxy deployment can now proceed!"
+          echo "   The nginx workflow should now work successfully."
