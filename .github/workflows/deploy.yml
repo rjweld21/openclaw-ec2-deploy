@@ -548,6 +548,7 @@ jobs:
       name: ${{ github.event.inputs.environment }}
     env:
       TF_VAR_environment: ${{ github.event.inputs.environment }}
+      TF_VAR_anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 
     steps:
       - name: Checkout code
