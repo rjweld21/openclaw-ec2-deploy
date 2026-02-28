@@ -21,14 +21,14 @@ export class FixEC2IamRoleStack extends cdk.Stack {
       ],
     });
 
-    // Create instance profile
-    const instanceProfile = new iam.InstanceProfile(this, 'OpenClawEC2InstanceProfile', {
-      role: ec2SSMRole,
+    // Create instance profile - FIXED: Use CfnInstanceProfile instead of InstanceProfile
+    const instanceProfile = new iam.CfnInstanceProfile(this, 'OpenClawEC2InstanceProfile', {
+      roles: [ec2SSMRole.roleName],
     });
 
     // Output the instance profile ARN for attachment
     new cdk.CfnOutput(this, 'InstanceProfileArn', {
-      value: instanceProfile.instanceProfileArn,
+      value: instanceProfile.attrArn,
       description: 'Instance Profile ARN to attach to OpenClaw EC2',
     });
 
@@ -38,7 +38,7 @@ export class FixEC2IamRoleStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'InstanceProfileName', {
-      value: instanceProfile.instanceProfileName,
+      value: instanceProfile.ref,
       description: 'Instance Profile Name for attachment',
     });
 
