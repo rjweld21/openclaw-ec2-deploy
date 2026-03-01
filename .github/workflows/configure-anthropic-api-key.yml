@@ -1,0 +1,140 @@
+name: Configure Anthropic API Key
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  OPENCLAW_INSTANCE_ID: i-0f7b10ac4566c4ea4
+
+jobs:
+  configure-api-key:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Configure Anthropic API Key via SSM
+      run: |
+        echo "🔑 Configuring Anthropic API Key for OpenClaw..."
+        
+        if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+          echo "❌ ERROR: ANTHROPIC_API_KEY secret not configured in GitHub"
+          echo "Please add your Anthropic API key as a GitHub secret named 'ANTHROPIC_API_KEY'"
+          exit 1
+        fi
+        
+        COMMAND_ID=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "$OPENCLAW_INSTANCE_ID" \
+          --parameters 'commands=[
+            "echo === CONFIGURING ANTHROPIC API KEY ===",
+            "cd /home/ec2-user",
+            "echo Current models before configuration:",
+            "openclaw models list",
+            "echo === ADDING ANTHROPIC AUTH PROFILE ===",
+            "echo Creating auth profile with API key...",
+            "ANTHROPIC_API_KEY=\"${{ secrets.ANTHROPIC_API_KEY }}\"",
+            "openclaw models auth paste-token --provider anthropic --token \"$ANTHROPIC_API_KEY\" --name default || echo \"Auth add failed, trying alternative method\"",
+            "echo === ALTERNATIVE: MANUAL AUTH PROFILE CREATION ===",
+            "mkdir -p ~/.openclaw",
+            "echo Creating auth-profiles.json if it does not exist...",
+            "cat > ~/.openclaw/auth-profiles.json << EOF",
+            "{",
+            "  \"anthropic\": {",
+            "    \"default\": {",
+            "      \"token\": \"$ANTHROPIC_API_KEY\",",
+            "      \"name\": \"default\",",
+            "      \"provider\": \"anthropic\",",
+            "      \"createdAt\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"",
+            "    }",
+            "  }",
+            "}",
+            "EOF",
+            "echo === RESTARTING OPENCLAW GATEWAY ===",
+            "systemctl --user restart openclaw-gateway",
+            "sleep 5",
+            "echo === VERIFYING CONFIGURATION ===",
+            "echo Updated models list:",
+            "openclaw models list",
+            "echo === TESTING MODEL ACCESS ===",
+            "echo Testing API key with a simple request:",
+            "timeout 30 openclaw agent --message \"Test: Say hello in exactly 3 words\" --no-deliver || echo \"Test request failed or timed out\""
+          ]' \
+          --comment "Configure Anthropic API key" \
+          --timeout-seconds 300 \
+          --query 'Command.CommandId' \
+          --output text)
+        
+        echo "Command ID: $COMMAND_ID"
+        
+        # Wait for completion
+        for i in {1..15}; do
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$OPENCLAW_INSTANCE_ID" \
+            --query 'Status' \
+            --output text 2>/dev/null || echo "InProgress")
+          
+          echo "Status: $STATUS (attempt $i/15)"
+          
+          if [ "$STATUS" = "Success" ]; then
+            echo "✅ API key configuration completed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$OPENCLAW_INSTANCE_ID" \
+              --query 'StandardOutputContent' \
+              --output text
+            break
+          elif [ "$STATUS" = "Failed" ]; then
+            echo "❌ API key configuration failed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$OPENCLAW_INSTANCE_ID" \
+              --query 'StandardErrorContent' \
+              --output text
+            exit 1
+          fi
+          
+          sleep 20
+        done
+
+    - name: Final Verification
+      run: |
+        echo "🧪 Final verification of Anthropic API configuration..."
+        
+        COMMAND_ID=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "$OPENCLAW_INSTANCE_ID" \
+          --parameters 'commands=[
+            "echo === FINAL STATUS CHECK ===",
+            "openclaw models list",
+            "echo === AUTH PROFILES ===",
+            "openclaw models auth list",
+            "echo === GATEWAY STATUS ===",
+            "systemctl --user status openclaw-gateway --no-pager",
+            "echo === CONFIGURATION COMPLETE ==="
+          ]' \
+          --comment "Verify API key configuration" \
+          --timeout-seconds 60 \
+          --query 'Command.CommandId' \
+          --output text)
+        
+        sleep 10
+        aws ssm get-command-invocation \
+          --command-id "$COMMAND_ID" \
+          --instance-id "$OPENCLAW_INSTANCE_ID" \
+          --query 'StandardOutputContent' \
+          --output text || echo "Verification command still running"
+        
+        echo "🎉 Anthropic API key configuration workflow complete!"
+        echo ""
+        echo "📋 Next steps:"
+        echo "1. Check the OpenClaw dashboard at https://44.199.189.188"
+        echo "2. Verify models show 'Auth: yes' in the models list"
+        echo "3. Test chat functionality with Anthropic models"
