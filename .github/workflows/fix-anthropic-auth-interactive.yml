@@ -1,0 +1,122 @@
+name: Fix Anthropic Auth - Interactive Method
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  OPENCLAW_INSTANCE_ID: i-0f7b10ac4566c4ea4
+
+jobs:
+  fix-auth-interactive:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Fix Anthropic Authentication via Interactive Method
+      run: |
+        echo "🔧 Fixing Anthropic API authentication..."
+        
+        if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+          echo "❌ ERROR: ANTHROPIC_API_KEY secret not found"
+          exit 1
+        fi
+        
+        COMMAND_ID=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "$OPENCLAW_INSTANCE_ID" \
+          --parameters 'commands=[
+            "echo === DEBUGGING CURRENT AUTH STATE ===",
+            "openclaw models list",
+            "echo === TRYING ALTERNATIVE AUTH METHODS ===",
+            "echo Method 1: Environment variable approach...",
+            "export ANTHROPIC_API_KEY=\"${{ secrets.ANTHROPIC_API_KEY }}\"",
+            "echo Testing with env var...",
+            "timeout 20 openclaw agent --message \"Test with env var\" --no-deliver || echo \"Env var method failed\"",
+            "echo Method 2: Alternative config location...", 
+            "mkdir -p ~/.config/openclaw",
+            "echo \"ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}\" > ~/.config/openclaw/anthropic.env",
+            "echo Method 3: Direct config injection...",
+            "cd ~/.openclaw",
+            "cp openclaw.json openclaw.json.backup-auth",
+            "echo Adding providers section to OpenClaw config...",
+            "cat openclaw.json | jq \". + {\\\"providers\\\": {\\\"anthropic\\\": {\\\"apiKey\\\": \\\"${{ secrets.ANTHROPIC_API_KEY }}\\\"}}}\" > openclaw.json.new",
+            "mv openclaw.json.new openclaw.json",
+            "echo === RESTARTING GATEWAY WITH NEW CONFIG ===",
+            "systemctl --user restart openclaw-gateway",
+            "sleep 10",
+            "echo === TESTING UPDATED CONFIGURATION ===",
+            "openclaw models list",
+            "echo === TESTING API ACCESS ===",
+            "timeout 30 openclaw agent --message \"Hello test\" --no-deliver || echo \"Still not working - may need different approach\"",
+            "echo === CHECKING GATEWAY LOGS ===",
+            "journalctl --user -u openclaw-gateway -n 5 --no-pager || echo \"No recent logs\"",
+            "echo === CONFIG VERIFICATION ===",
+            "cat openclaw.json | jq .providers || echo \"No providers section found\""
+          ]' \
+          --comment "Fix Anthropic auth via multiple methods" \
+          --timeout-seconds 300 \
+          --query 'Command.CommandId' \
+          --output text)
+        
+        echo "Command ID: $COMMAND_ID"
+        
+        # Wait for completion
+        for i in {1..12}; do
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$OPENCLAW_INSTANCE_ID" \
+            --query 'Status' \
+            --output text 2>/dev/null || echo "InProgress")
+          
+          echo "Status: $STATUS (attempt $i/12)"
+          
+          if [ "$STATUS" = "Success" ]; then
+            echo "✅ Auth fix completed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$OPENCLAW_INSTANCE_ID" \
+              --query 'StandardOutputContent' \
+              --output text
+            break
+          elif [ "$STATUS" = "Failed" ]; then
+            echo "❌ Auth fix failed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$OPENCLAW_INSTANCE_ID" \
+              --query 'StandardErrorContent' \
+              --output text
+            exit 1
+          fi
+          
+          sleep 25
+        done
+
+    - name: Final API Test
+      run: |
+        echo "🧪 Testing if Anthropic API is now working..."
+        
+        sleep 5
+        FINAL_TEST=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "$OPENCLAW_INSTANCE_ID" \
+          --parameters 'commands=["openclaw models list","timeout 30 openclaw agent --message \"Final test: respond with OK\" --no-deliver || echo FAILED"]' \
+          --timeout-seconds 60 \
+          --query 'Command.CommandId' \
+          --output text)
+        
+        sleep 20
+        aws ssm get-command-invocation \
+          --command-id "$FINAL_TEST" \
+          --instance-id "$OPENCLAW_INSTANCE_ID" \
+          --query 'StandardOutputContent' \
+          --output text || echo "Final test still running..."
+        
+        echo "🎯 If models list shows 'Auth: yes', configuration is successful!"
+        echo "🎯 Test the dashboard chat at: https://44.199.189.188"
