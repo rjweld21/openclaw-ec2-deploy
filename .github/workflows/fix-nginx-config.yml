@@ -1,0 +1,153 @@
+name: Fix nginx Configuration Corruption
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  OPENCLAW_INSTANCE_ID: i-0f7b10ac4566c4ea4
+
+jobs:
+  fix-nginx-config:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Restore and Fix nginx Configuration
+      run: |
+        echo "🔧 Restoring nginx configuration..."
+        
+        COMMAND_ID=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "$OPENCLAW_INSTANCE_ID" \
+          --parameters 'commands=[
+            "echo === RESTORING BACKUP ===",
+            "sudo cp /etc/nginx/nginx.conf.backup /etc/nginx/nginx.conf",
+            "echo === USING SIMPLER APPROACH ===",
+            "echo Removing default.conf to avoid conflicts...",
+            "sudo rm -f /etc/nginx/conf.d/default.conf",
+            "echo === CREATING CLEAN OPENCLAW CONFIG ===",
+            "sudo tee /etc/nginx/conf.d/openclaw.conf > /dev/null << \"EOF\"",
+            "server {",
+            "    listen 80;",
+            "    server_name _;",
+            "    return 301 https://\\$server_name\\$request_uri;",
+            "}",
+            "",
+            "server {", 
+            "    listen 443 ssl http2;",
+            "    server_name _;",
+            "",
+            "    ssl_certificate /etc/nginx/ssl/openclaw.crt;",
+            "    ssl_certificate_key /etc/nginx/ssl/openclaw.key;",
+            "    ssl_protocols TLSv1.2 TLSv1.3;",
+            "",
+            "    location / {",
+            "        proxy_pass http://127.0.0.1:8080;",
+            "        proxy_http_version 1.1;",
+            "        proxy_set_header Upgrade \\$http_upgrade;",
+            "        proxy_set_header Connection \\\"upgrade\\\";",
+            "        proxy_set_header Host \\$host;",
+            "        proxy_set_header X-Real-IP \\$remote_addr;",
+            "        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;",
+            "        proxy_set_header X-Forwarded-Proto \\$scheme;",
+            "        proxy_cache_bypass \\$http_upgrade;",
+            "        proxy_read_timeout 86400;",
+            "        proxy_connect_timeout 86400;", 
+            "        proxy_send_timeout 86400;",
+            "    }",
+            "}",
+            "EOF",
+            "echo === DISABLING DEFAULT SERVER IN NGINX.CONF ===",
+            "sudo sed -i \"/listen.*80/d\" /etc/nginx/nginx.conf",
+            "sudo sed -i \"/listen.*\\[\\:\\:\\]\\:80/d\" /etc/nginx/nginx.conf", 
+            "echo === TESTING CONFIG ===",
+            "sudo nginx -t",
+            "echo === RESTARTING NGINX ===",
+            "sudo systemctl restart nginx",
+            "sleep 5",
+            "echo === VERIFYING ===",
+            "sudo systemctl status nginx --no-pager",
+            "echo === LOCAL TESTS ===",
+            "curl -s -w \"HTTP: %{http_code}\" http://localhost/",
+            "echo",
+            "curl -k -s -w \"HTTPS: %{http_code}\" https://localhost/",
+            "echo"
+          ]' \
+          --comment "Fix nginx config corruption" \
+          --timeout-seconds 300 \
+          --query 'Command.CommandId' \
+          --output text)
+        
+        echo "Command ID: $COMMAND_ID"
+        
+        # Wait for completion
+        for i in {1..15}; do
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$OPENCLAW_INSTANCE_ID" \
+            --query 'Status' \
+            --output text 2>/dev/null || echo "InProgress")
+          
+          echo "Status: $STATUS (attempt $i/15)"
+          
+          if [ "$STATUS" = "Success" ]; then
+            echo "✅ Fix completed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$OPENCLAW_INSTANCE_ID" \
+              --query 'StandardOutputContent' \
+              --output text
+            break
+          elif [ "$STATUS" = "Failed" ]; then
+            echo "❌ Fix failed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$OPENCLAW_INSTANCE_ID" \
+              --query 'StandardErrorContent' \
+              --output text
+            exit 1
+          fi
+          
+          sleep 20
+        done
+
+    - name: Verify External Access
+      run: |
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids "$OPENCLAW_INSTANCE_ID" \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+        
+        echo "Final testing $PUBLIC_IP..."
+        
+        sleep 10
+        HTTP_STATUS=$(curl -s -w "%{http_code}" -o /dev/null "http://$PUBLIC_IP" --connect-timeout 15 || echo "000")
+        HTTPS_STATUS=$(curl -k -s -w "%{http_code}" -o /dev/null "https://$PUBLIC_IP" --connect-timeout 15 || echo "000")
+        OPENCLAW_STATUS=$(curl -s -w "%{http_code}" -o /dev/null "http://$PUBLIC_IP:8080" --connect-timeout 15 || echo "000")
+        
+        echo "HTTP: $HTTP_STATUS (should be 301 redirect)"
+        echo "HTTPS: $HTTPS_STATUS (should be 200 or 400 gateway)"  
+        echo "OpenClaw Direct: $OPENCLAW_STATUS (should be 200)"
+        
+        if [ "$HTTP_STATUS" = "301" ] || [ "$HTTP_STATUS" = "200" ]; then
+          if [ "$HTTPS_STATUS" != "000" ] && [ "$OPENCLAW_STATUS" = "200" ]; then
+            echo "🎉 SUCCESS: All endpoints working!"
+            echo ""
+            echo "📋 Final Access URLs:"
+            echo "  HTTPS: https://$PUBLIC_IP"
+            echo "  HTTP:  http://$PUBLIC_IP (redirects)"
+            echo "  Direct: http://$PUBLIC_IP:8080"
+            exit 0
+          fi
+        fi
+        
+        echo "⚠️  Some endpoints still have issues"
+        echo "  This may need additional iteration"
+        exit 1
